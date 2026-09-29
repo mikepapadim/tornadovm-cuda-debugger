@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tcd · TornadoVM CUDA debugger</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">tcd</span><span class="sub">TornadoVM CUDA debugger</span></div>
+  <div class="controls">
+    <button data-action="run" title="Run the program">Run</button>
+    <button data-action="continue" title="Continue (F5)">Continue <kbd>F5</kbd></button>
+    <button data-action="next" title="Step over (F10)">Next <kbd>F10</kbd></button>
+    <button data-action="step" title="Step into (F11)">Step <kbd>F11</kbd></button>
+    <button data-action="finish" title="Step out (Shift+F11)">Finish</button>
+    <button data-action="interrupt" title="Pause">Pause</button>
+    <button data-action="kill" class="danger" title="Kill the program">Kill</button>
+  </div>
+  <div id="status" class="status idle">idle</div>
+</header>
+
+<main>
+  <aside class="left">
+    <section>
+      <h2>Kernels</h2>
+      <ul id="kernels" class="list"><li class="muted">JIT-compiled kernels appear here</li></ul>
+    </section>
+    <section>
+      <h2>Breakpoints</h2>
+      <form id="bp-form" class="row">
+        <input id="bp-input" placeholder="kernel or kernel:line" autocomplete="off">
+        <button type="submit">Add</button>
+      </form>
+      <ul id="breakpoints" class="list"></ul>
+      <p class="hint">A kernel is named after its Java method. Break on its entry before running, then click a line number in the source.</p>
+    </section>
+  </aside>
+
+  <section class="center">
+    <div class="source-head">
+      <span id="src-title">No kernel stopped</span>
+      <span id="src-where" class="muted"></span>
+    </div>
+    <div id="source" class="source"><div class="empty">
+      <p>Set a breakpoint on a kernel (for example <code>add</code>), then press <b>Run</b>.</p>
+      <p class="muted">The generated CUDA C appears here, exactly as TornadoVM compiled it with <code>-G -lineinfo</code>.</p>
+    </div></div>
+  </section>
+
+  <aside class="right">
+    <section>
+      <h2>CUDA focus</h2>
+      <form id="focus-form" class="focus">
+        <label>block <input id="bx" value="0"> <input id="by" value="0"> <input id="bz" value="0"></label>
+        <label>thread <input id="tx" value="0"> <input id="ty" value="0"> <input id="tz" value="0"></label>
+        <button type="submit">Switch</button>
+      </form>
+      <div id="focus-now" class="muted small"></div>
+    </section>
+    <section>
+      <h2>Locals <span class="muted small">· changed values highlighted</span></h2>
+      <table id="locals" class="kv"></table>
+    </section>
+    <section>
+      <h2>__shared__</h2>
+      <table id="shared" class="kv"></table>
+    </section>
+    <section>
+      <h2>Watch</h2>
+      <form id="watch-form" class="row">
+        <input id="watch-input" placeholder="expression, e.g. i_3 * 2" autocomplete="off">
+        <button type="submit">Add</button>
+      </form>
+      <table id="watches" class="kv"></table>
+    </section>
+    <section>
+      <h2>TornadoVM array</h2>
+      <form id="array-form" class="row wrap">
+        <input id="arr-expr" placeholder="arg1" size="6">
+        <select id="arr-type"><option>float</option><option>int</option><option>double</option><option>long long</option><option>short</option><option>char</option></select>
+        <input id="arr-start" value="0" size="4" title="first element">
+        <input id="arr-count" value="16" size="4" title="count">
+        <button type="submit">Read</button>
+      </form>
+      <div id="array-out" class="mono small"></div>
+    </section>
+  </aside>
+
+  <section class="bottom">
+    <nav class="tabs">
+      <button data-tab="console" class="active">Console</button>
+      <button data-tab="warps">Warps</button>
+      <button data-tab="cudakernels">Kernels (device)</button>
+      <button data-tab="program">Program output</button>
+    </nav>
+    <div id="tab-console" class="tab active">
+      <pre id="console" class="log"></pre>
+      <form id="cmd-form" class="row"><span class="prompt">(cuda-gdb)</span><input id="cmd-input" placeholder="any cuda-gdb command: info cuda lanes, tcd-shared adf_2 float 0 32, print ..." autocomplete="off"></form>
+    </div>
+    <div id="tab-warps" class="tab"><pre id="warps" class="log"></pre></div>
+    <div id="tab-cudakernels" class="tab"><pre id="cudakernels" class="log"></pre></div>
+    <div id="tab-program" class="tab"><pre id="program" class="log"></pre></div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

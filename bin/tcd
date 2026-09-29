@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# tcd - tornado-cuda-debug launcher. Runs tcd.java from this checkout with
+# jbang when available, otherwise with the JDK's single-file source launcher.
+set -euo pipefail
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+export TCD_HOME="$(cd "$(dirname "$SELF")/.." && pwd)"
+if [[ -n "${TCD_JAVA:-}" ]]; then
+  exec "$TCD_JAVA" "$TCD_HOME/tcd.java" "$@"
+elif command -v jbang >/dev/null 2>&1; then
+  exec jbang --quiet "$TCD_HOME/tcd.java" "$@"
+else
+  exec java "$TCD_HOME/tcd.java" "$@"
+fi
