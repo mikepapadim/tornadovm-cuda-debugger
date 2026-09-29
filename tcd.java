@@ -2,6 +2,7 @@
 //JAVA 21+
 //FILES gdb/tornado.gdbinit=gdb/tornado.gdbinit
 //FILES gdb/tornado_gdb.py=gdb/tornado_gdb.py
+//FILES agent/TcdAgent.java=agent/TcdAgent.java
 //FILES web/index.html=web/index.html
 //FILES web/app.js=web/app.js
 //FILES web/style.css=web/style.css
@@ -29,6 +30,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -69,6 +71,8 @@ public class tcd {
         int hits = 1;
         int timeout = 600;
         int elements = 16;
+        boolean fastStart = true;
+        long pid;
         boolean json;
         boolean verbose;
         boolean tui;
@@ -103,6 +107,8 @@ public class tcd {
                 case "--hits" -> o.hits = Integer.parseInt(args[++i]);
                 case "--timeout" -> o.timeout = Integer.parseInt(args[++i]);
                 case "--elements" -> o.elements = Integer.parseInt(args[++i]);
+                case "--no-fast-start" -> o.fastStart = false;
+                case "--pid" -> o.pid = Long.parseLong(args[++i]);
                 case "--json" -> o.json = true;
                 case "--verbose", "-v" -> o.verbose = true;
                 case "--tui" -> o.tui = true;
@@ -151,19 +157,29 @@ public class tcd {
                   batch      run to a kernel breakpoint and report thread state (text or --json)
                   memcheck   run under compute-sanitizer; reports mapped to generated source lines
                   ui         web debugger on http://127.0.0.1:PORT
+                  launch     start a long-running app with debug kernels, ready for `attach` (no debugger yet)
+                  attach PID interactive cuda-gdb on an app started with `tcd launch` (detach leaves it running)
+                  dap        Debug Adapter Protocol server on stdin/stdout (VS Code, IntelliJ + LSP4IJ, ...)
+                  diff A B   compare two `batch --json` reports (e.g. buggy vs fixed), thread by thread
                   version    print version
 
                 Options:
-                  --break, -b K[:L]   break in device kernel K (a Java method name), optionally at
-                                      line L of the generated CUDA C. Repeatable.
+                  --break, -b SPEC    break in device kernel K (a Java method name). SPEC is
+                                      K[:L][@B:T][ if COND]: line L of the generated CUDA C, only
+                                      block B / thread T, or any per-thread condition. Repeatable.
+                                      e.g. -b reduce:33@0:64   -b "reduce:33 if i_10 == 8"
                   --at B:T            thread to inspect: 1-D "2:5" or 3-D "2,0,0:5,0,0". Repeatable.
                   --print, -p e1,e2   extra expressions to evaluate per thread
                   --hits N            batch: stop after N breakpoint hits (default 1)
-                  --json              batch: machine-readable output
+                  --json              batch/memcheck: machine-readable output (memcheck: summary only,
+                                      full reports in the session's sanitizer-<tool>.log)
+                  --pid PID           batch: attach to an app started with `tcd launch` instead of starting one
                   --timeout SECS      batch: kill the session after SECS seconds (default 600)
+                  --no-fast-start     do not skip TornadoVM's CUDA transfer warm-up (see agent/TcdAgent.java)
                   --elements N        batch/run/ui: array elements shown for locals and __shared__ (default 16)
                   --tool NAME         memcheck: sanitizer tool(s) (memcheck, racecheck, initcheck, synccheck)
                   --verbose, -v       memcheck: print every sanitizer report, not only the first 3
+                                      memcheck exits 1 on sanitizer errors, else the app's exit code (CI)
                   --flags "..."       extra NVRTC flags (added to -G -lineinfo)
                   --tui               run: start cuda-gdb in TUI mode
                   --no-run            run/ui: do not start the program automatically
@@ -191,6 +207,10 @@ public class tcd {
             case "run" -> run(o);
             case "batch" -> batch(o);
             case "memcheck" -> memcheck(o);
+            case "diff" -> diff(o);
+            case "dap" -> Dap.serve(o);
+            case "launch" -> launch(o);
+            case "attach" -> attach(o);
             case "ui" -> ui(o);
             case "version", "--version" -> {
                 out.println("tcd " + VERSION);
@@ -311,6 +331,7 @@ public class tcd {
         final Path dumpAbs;
         final boolean keep;
         int elements = 16;
+        boolean attachable;
 
         Session(Path th, boolean keep) throws IOException {
             String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS"));
@@ -340,6 +361,28 @@ public class tcd {
                     "-Dtornado.opencl.source.dir=" + dumpRel,
                     // A cubin cached from a non-debug run must never be picked up.
                     "-Dtornado.cuda.codecache.enable=false"));
+            if (o.fastStart || attachable) {
+                Path agent = startupAgent(tornadoHome);
+                if (agent != null) {
+                    extra.add("-javaagent:" + agent + "=" + (o.fastStart ? "fast" : "") + (attachable ? ",ptracer" : ""));
+                } else if (attachable) {
+                    err.println("tcd: could not build the agent; attaching needs ptrace_scope 0 or root");
+                }
+            }
+            if (attachable) {
+                // The agent's prctl downcall comes from the unnamed module; TornadoVM grants native
+                // access to tornado.runtime only.
+                boolean found = false;
+                for (int i = 0; i < cmd.size(); i++) {
+                    if (cmd.get(i).startsWith("--enable-native-access=")) {
+                        cmd.set(i, cmd.get(i) + ",ALL-UNNAMED");
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    extra.add("--enable-native-access=ALL-UNNAMED");
+                }
+            }
             cmd.addAll(1, extra);
             cmd.addAll(o.appArgs);
             return cmd;
@@ -372,6 +415,51 @@ public class tcd {
             } catch (IOException e) {
                 err.println("tcd: could not collect kernel dumps: " + e.getMessage());
             }
+        }
+    }
+
+    /**
+     * Builds (once, cached) the javaagent that removes TornadoVM's CUDA transfer warm-up: about
+     * 5,000 driver calls that take microseconds natively but about 20 s under cuda-gdb. It is compiled
+     * here against the SDK's own ASM jar, so no binary is shipped. Returns null (and the session
+     * just starts slower) if anything is missing.
+     */
+    static Path startupAgent(Path th) {
+        try (Stream<Path> jars = Files.list(th.resolve("share/java/tornado"))) {
+            Path asm = jars.filter(p -> p.getFileName().toString().matches("asm-\\d[\\d.]*\\.jar")).findFirst().orElse(null);
+            javax.tools.JavaCompiler javac = javax.tools.ToolProvider.getSystemJavaCompiler();
+            if (asm == null || javac == null) {
+                return null;
+            }
+            Path src = resource("agent/TcdAgent.java");
+            String key = Integer.toHexString((Files.readString(src) + asm.getFileName()).hashCode());
+            Path dir = Path.of(System.getProperty("user.home"), ".tornado-cuda-debug", "agent");
+            Path jar = dir.resolve("tcd-agent-" + key + ".jar");
+            if (Files.exists(jar)) {
+                return jar;
+            }
+            Path classes = Files.createTempDirectory("tcd-agent");
+            int rc = javac.run(null, null, err, "--release", "21", "-nowarn", "-cp", asm.toString(), "-d", classes.toString(), src.toString());
+            if (rc != 0) {
+                return null;
+            }
+            Files.createDirectories(dir);
+            java.util.jar.Manifest mf = new java.util.jar.Manifest();
+            mf.getMainAttributes().put(java.util.jar.Attributes.Name.MANIFEST_VERSION, "1.0");
+            mf.getMainAttributes().putValue("Premain-Class", "TcdAgent");
+            Path tmp = dir.resolve(jar.getFileName() + ".tmp");
+            try (java.util.jar.JarOutputStream jos = new java.util.jar.JarOutputStream(Files.newOutputStream(tmp), mf); Stream<Path> cs = Files.walk(classes)) {
+                for (Path c : cs.filter(Files::isRegularFile).toList()) {
+                    jos.putNextEntry(new java.util.jar.JarEntry(classes.relativize(c).toString().replace('\\', '/')));
+                    jos.write(Files.readAllBytes(c));
+                    jos.closeEntry();
+                }
+            }
+            Files.move(tmp, jar, StandardCopyOption.REPLACE_EXISTING);
+            deleteTree(classes);
+            return jar;
+        } catch (IOException | RuntimeException e) {
+            return null;
         }
     }
 
@@ -499,19 +587,102 @@ public class tcd {
         return rc;
     }
 
+    // ------------------------------------------------------------------ launch / attach
+
+    static Path launchedFile(long pid) {
+        return Path.of(System.getProperty("user.home"), ".tornado-cuda-debug", "launched", pid + ".json");
+    }
+
+    /** Runs the app in the foreground with debug kernels and attach permission; prints how to attach. */
+    static int launch(Options o) throws Exception {
+        requireApp(o);
+        Session s = new Session(tornadoHome(o), o.keep);
+        s.elements = o.elements;
+        s.attachable = true;
+        ProcessBuilder pb = new ProcessBuilder(s.javaCommand(o, "-G -lineinfo")).inheritIO();
+        pb.environment().putAll(s.env());
+        Process p = pb.start();
+        Path info = launchedFile(p.pid());
+        Files.createDirectories(info.getParent());
+        Files.writeString(info, Json.write(Map.of("session", s.dir.toString(), "dumpRoot", s.dumpAbs.toString(), "tornadoHome", s.tornadoHome.toString())));
+        err.println("tcd: launched pid " + p.pid() + " with debug kernels (session " + s.dir + ")");
+        err.println("tcd: in another terminal:  tcd attach " + p.pid() + " -b <kernel>[:line]     or  tcd batch --pid " + p.pid() + " -b <kernel> --json");
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            p.destroy();
+            s.close();
+            try {
+                Files.deleteIfExists(info);
+            } catch (IOException ignored) {
+            }
+        }));
+        return p.waitFor();
+    }
+
+    /** Environment of a session started by `tcd launch` for this pid. */
+    static Map<String, String> launchedEnv(long pid) throws IOException {
+        Path info = launchedFile(pid);
+        if (!Files.exists(info)) {
+            throw new IllegalStateException("pid " + pid + " was not started with `tcd launch`, so its kernels have no debug info and it may refuse ptrace");
+        }
+        Object doc = Json.parse(Files.readString(info));
+        Map<String, String> env = new LinkedHashMap<>();
+        env.put("TORNADOVM_HOME", String.valueOf(Json.path(doc, "tornadoHome")));
+        env.put("TCD_SESSION", String.valueOf(Json.path(doc, "session")));
+        env.put("TCD_DUMP_ROOT", String.valueOf(Json.path(doc, "dumpRoot")));
+        return env;
+    }
+
+    static int attach(Options o) throws Exception {
+        if (o.pid == 0 && !o.appArgs.isEmpty()) {
+            o.pid = Long.parseLong(o.appArgs.get(0));
+        }
+        if (o.pid == 0) {
+            err.println("usage: tcd attach PID [-b kernel[:line]]...   (PID from `tcd launch`)");
+            return 2;
+        }
+        Map<String, String> env = launchedEnv(o.pid);
+        env.put("TCD_MAX_ELEMENTS", String.valueOf(o.elements));
+        List<String> cmd = gdbBase(o, false);
+        if (o.tui) {
+            cmd.add("-tui");
+        }
+        for (String b : o.breaks) {
+            cmd.addAll(List.of("-ex", "tcd-break " + b));
+        }
+        if (!o.noRun && !o.breaks.isEmpty()) {
+            cmd.addAll(List.of("-ex", "continue"));
+        }
+        cmd.addAll(List.of("-p", String.valueOf(o.pid)));
+        err.println("tcd: attaching to " + o.pid + ". `detach` leaves the app running, `quit` detaches too.");
+        ProcessBuilder pb = new ProcessBuilder(cmd).inheritIO();
+        pb.environment().putAll(env);
+        return pb.start().waitFor();
+    }
+
     // ------------------------------------------------------------------ batch
 
     static int batch(Options o) throws Exception {
-        requireApp(o);
+        if (o.pid == 0) {
+            requireApp(o);
+        }
         if (o.breaks.isEmpty()) {
             err.println("tcd batch: give at least one --break KERNEL[:LINE]");
             return 2;
         }
-        Session s = new Session(tornadoHome(o), o.keep);
-        s.elements = o.elements;
+        Session s = o.pid != 0 ? null : new Session(tornadoHome(o), o.keep);
         List<String> cmd = gdbBase(o, false);
-        cmd.addAll(List.of("-batch", "-ex", "tcd-batch", "--args"));
-        cmd.addAll(s.javaCommand(o, "-G -lineinfo"));
+        Map<String, String> env;
+        if (s == null) {
+            env = launchedEnv(o.pid);
+            cmd.addAll(List.of("-batch", "-ex", "tcd-batch", "-p", String.valueOf(o.pid)));
+        } else {
+            s.elements = o.elements;
+            env = s.env();
+            cmd.addAll(List.of("-batch", "-ex", "tcd-batch", "--args"));
+            cmd.addAll(s.javaCommand(o, "-G -lineinfo"));
+        }
+        env.put("TCD_MAX_ELEMENTS", String.valueOf(o.elements));
+        Path sessionDir = Path.of(env.get("TCD_SESSION"));
 
         StringBuilder spec = new StringBuilder("{\"break\":[");
         for (int i = 0; i < o.breaks.size(); i++) {
@@ -531,13 +702,16 @@ public class tcd {
             }
             spec.append("]");
         }
+        if (o.pid != 0) {
+            spec.append(",\"attach\":true");
+        }
         spec.append("}");
 
         ProcessBuilder pb = new ProcessBuilder(cmd).redirectErrorStream(true);
-        pb.environment().putAll(s.env());
+        pb.environment().putAll(env);
         pb.environment().put("TCD_BATCH", spec.toString());
         if (!o.json) {
-            err.println("tcd: running under cuda-gdb (session " + s.dir + ") ...");
+            err.println("tcd: " + (s == null ? "attached to " + o.pid : "running under cuda-gdb") + " (session " + sessionDir + ") ...");
         }
         Process p = pb.start();
         Thread watchdog = Thread.ofVirtual().start(() -> {
@@ -562,10 +736,13 @@ public class tcd {
         }
         int rc = p.waitFor();
         watchdog.interrupt();
-        Files.writeString(s.dir.resolve("gdb.log"), log);
-        s.close();
+        Path gdbLog = sessionDir.resolve(s == null ? "gdb-attach-" + System.currentTimeMillis() + ".log" : "gdb.log");
+        Files.writeString(gdbLog, log);
+        if (s != null) {
+            s.close();
+        }
         if (report == null) {
-            err.println("tcd: no report produced (cuda-gdb exit " + rc + "). Log: " + s.dir.resolve("gdb.log"));
+            err.println("tcd: no report produced (cuda-gdb exit " + rc + "). Log: " + gdbLog);
             log.toString().lines().filter(l -> !l.startsWith("[New Thread") && !l.contains("exited]")).skip(Math.max(0, log.toString().lines().count() - 25)).forEach(err::println);
             return 1;
         }
@@ -573,13 +750,13 @@ public class tcd {
         if (o.json) {
             out.println(report);
         } else {
-            printBatch(Json.path(doc, "batch"), s);
+            printBatch(Json.path(doc, "batch"), sessionDir);
         }
         return 0;
     }
 
     @SuppressWarnings("unchecked")
-    static void printBatch(Object b, Session s) {
+    static void printBatch(Object b, Path sessionDir) {
         List<Object> hits = (List<Object>) Json.path(b, "hits");
         if (hits == null || hits.isEmpty()) {
             out.println("No breakpoint was hit (" + Json.path(b, "exit") + "). Check the kernel name: it is the Java method name of the task.");
@@ -598,8 +775,16 @@ public class tcd {
             Object w = Json.path(h, "where");
             out.printf("%n== hit %d: %s at line %s   %s%n", ++n, Json.path(w, "function"), Json.path(w, "line"), Optional.ofNullable(Json.path(w, "code")).orElse(""));
             printContext((String) Json.path(w, "source"), toInt(Json.path(w, "line")));
+            Map<String, Object> arrays = (Map<String, Object>) Json.path(h, "arrays");
+            if (arrays != null && !arrays.isEmpty()) {
+                out.println("\n   array arguments (global memory, same for every thread):");
+                arrays.forEach((k, v) -> out.printf("   %-20s = %s%n", k, v));
+            }
+            printThreadDifferences((List<Object>) Json.path(h, "threads"));
             for (Object t : (List<Object>) Json.path(h, "threads")) {
-                out.printf("%n-- block %s thread %s  (line %s)%n", coord(Json.path(t, "block")), coord(Json.path(t, "thread")), Json.path(t, "line"));
+                Object meaning = Json.path(t, "meaning");
+                out.printf("%n-- block %s thread %s  (line %s%s)%n", coord(Json.path(t, "block")), coord(Json.path(t, "thread")), Json.path(t, "line"),
+                        meaning == null ? "" : ": " + meaning);
                 if (Json.path(t, "error") != null) {
                     out.println("   " + Json.path(t, "error"));
                     continue;
@@ -614,13 +799,68 @@ public class tcd {
                 if (shared != null) {
                     shared.forEach((k, v) -> out.printf("   __shared__ %-9s = %s%n", k, v));
                 }
+                Map<String, Object> hints = (Map<String, Object>) Json.path(t, "hints");
                 if (locals != null) {
                     locals.entrySet().stream().filter(e -> !e.getKey().startsWith("_")).sorted(Map.Entry.comparingByKey(tcd::naturalOrder))
-                            .forEach(e -> out.printf("   %-20s = %s%n", e.getKey(), e.getValue()));
+                            .forEach(e -> {
+                                Object hint = hints == null ? null : hints.get(e.getKey());
+                                String v = String.valueOf(e.getValue());
+                                out.printf("   %-20s = %s%n", e.getKey(), hint == null ? v : String.format("%-24s # %s", v, hint));
+                            });
                 }
             }
         }
-        out.println("\n(" + Json.path(b, "exit") + "; generated sources in " + s.dir.resolve("src") + ")");
+        out.println("\n(" + Json.path(b, "exit") + "; generated sources in " + sessionDir.resolve("src") + ")");
+    }
+
+    /**
+     * With several threads, the locals whose values differ are the interesting ones. A loop
+     * variable that differs between warps of one block at the same stop, for example, shows a missing barrier.
+     */
+    @SuppressWarnings("unchecked")
+    static void printThreadDifferences(List<Object> threads) {
+        List<Map<String, Object>> ok = new ArrayList<>();
+        for (Object t : threads) {
+            if (Json.path(t, "locals") instanceof Map<?, ?> m && !m.isEmpty()) {
+                ok.add((Map<String, Object>) t);
+            }
+        }
+        if (ok.size() < 2) {
+            return;
+        }
+        List<String> names = new ArrayList<>(((Map<String, Object>) ok.get(0).get("locals")).keySet());
+        names.removeIf(n -> n.startsWith("_") || n.startsWith("ul_") || n.startsWith("arg"));
+        names.sort(tcd::naturalOrder);
+        List<String> differing = new ArrayList<>();
+        for (String n : names) {
+            Object first = ((Map<String, Object>) ok.get(0).get("locals")).get(n);
+            for (Map<String, Object> t : ok) {
+                Object v = ((Map<String, Object>) t.get("locals")).get(n);
+                if (!String.valueOf(first).equals(String.valueOf(v)) && !String.valueOf(v).startsWith("<")) {
+                    differing.add(n);
+                    break;
+                }
+            }
+        }
+        if (differing.isEmpty()) {
+            return;
+        }
+        out.println("\n   locals that differ between the inspected threads:");
+        StringBuilder head = new StringBuilder(String.format("   %-12s", ""));
+        for (Map<String, Object> t : ok) {
+            head.append(String.format(" %-16s", "b" + coord(t.get("block")).replace(",0,0)", ")").replace("(", "") + " t" + coord(t.get("thread")).replace(",0,0)", ")").replace("(", "").replace(")", "")));
+        }
+        out.println(head.toString().replace(")", ""));
+        Map<String, Object> hints0 = (Map<String, Object>) ok.get(0).get("hints");
+        for (String n : differing) {
+            StringBuilder row = new StringBuilder(String.format("   %-12s", n));
+            for (Map<String, Object> t : ok) {
+                row.append(String.format(" %-16s", String.valueOf(((Map<String, Object>) t.get("locals")).get(n))));
+            }
+            Object hint = hints0 == null ? null : hints0.get(n);
+            out.println(row + (hint == null ? "" : "  # " + hint));
+        }
+        out.println("   (line: " + String.join(", ", ok.stream().map(t -> String.valueOf(t.get("line"))).toList()) + ")");
     }
 
     /** Orders generated names by their numeric suffix: i_3 before l_4 before f_12. */
@@ -654,6 +894,112 @@ public class tcd {
         return o instanceof Number n ? n.intValue() : -1;
     }
 
+    // ------------------------------------------------------------------ diff
+
+    /** tcd diff a.json b.json: which locals differ for the same thread at the same hit. */
+    @SuppressWarnings("unchecked")
+    static int diff(Options o) throws IOException {
+        if (o.appArgs.size() != 2) {
+            err.println("usage: tcd diff A.json B.json   (reports from `tcd batch --json`)");
+            return 2;
+        }
+        Object a = Json.path(Json.parse(lastJsonLine(Path.of(o.appArgs.get(0)))), "batch");
+        Object b = Json.path(Json.parse(lastJsonLine(Path.of(o.appArgs.get(1)))), "batch");
+        List<Object> ha = (List<Object>) Json.path(a, "hits"), hb = (List<Object>) Json.path(b, "hits");
+        int differences = 0;
+        for (int i = 0; i < Math.min(ha.size(), hb.size()); i++) {
+            Object wa = Json.path(ha.get(i), "where"), wb = Json.path(hb.get(i), "where");
+            out.printf("== hit %d: A %s:%s   B %s:%s%n", i + 1, Json.path(wa, "function"), Json.path(wa, "line"), Json.path(wb, "function"), Json.path(wb, "line"));
+            Map<String, Object> byThreadB = new LinkedHashMap<>();
+            for (Object t : (List<Object>) Json.path(hb.get(i), "threads")) {
+                byThreadB.put(coord(Json.path(t, "block")) + coord(Json.path(t, "thread")), t);
+            }
+            for (Object ta : (List<Object>) Json.path(ha.get(i), "threads")) {
+                String id = coord(Json.path(ta, "block")) + coord(Json.path(ta, "thread"));
+                Object tb = byThreadB.get(id);
+                if (tb == null) {
+                    continue;
+                }
+                // Same kernel: compare by generated name. Different kernels (such as buggy vs fixed) number
+                // their SSA values differently, so compare by meaning instead (ctx.globalIdx, arg1[...]).
+                boolean sameKernel = Objects.equals(Json.path(wa, "function"), Json.path(wb, "function"));
+                Map<String, Object> la = sameKernel ? merged(ta) : byMeaning(ta), lb = sameKernel ? merged(tb) : byMeaning(tb);
+                Map<String, Object> hints = sameKernel ? (Map<String, Object>) Json.path(ta, "hints") : null;
+                List<String> names = new ArrayList<>(la.keySet());
+                names.retainAll(lb.keySet());
+                names.sort(tcd::naturalOrder);
+                List<String> rows = new ArrayList<>();
+                for (String n : names) {
+                    String va = String.valueOf(la.get(n)), vb = String.valueOf(lb.get(n));
+                    if (!va.equals(vb) && (!sameKernel || !n.startsWith("_") && !n.startsWith("ul_") && !n.startsWith("arg"))) {
+                        Object hint = hints == null ? null : hints.get(n);
+                        rows.add(String.format("   %-14s A=%-18s B=%-18s%s", n, va, vb, hint == null ? "" : " # " + hint));
+                    }
+                }
+                if (sameKernel && !Objects.equals(Json.path(ta, "line"), Json.path(tb, "line"))) {
+                    rows.add(0, String.format("   %-14s A=%-18s B=%s", "(line)", Json.path(ta, "line"), Json.path(tb, "line")));
+                }
+                out.printf("-- block %s thread %s: %s%s%n", coord(Json.path(ta, "block")), coord(Json.path(ta, "thread")), rows.isEmpty() ? "same" : rows.size() + " difference(s)",
+                        sameKernel ? "" : "  (different kernels: compared by meaning)");
+                rows.forEach(out::println);
+                differences += rows.size();
+            }
+        }
+        if (ha.size() != hb.size()) {
+            out.printf("(A has %d hit(s), B has %d)%n", ha.size(), hb.size());
+        }
+        return differences == 0 ? 0 : 1;
+    }
+
+    /** Values keyed by their recovered Java meaning; the first variable with a meaning wins. */
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> byMeaning(Object thread) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        Map<String, Object> locals = (Map<String, Object>) Json.path(thread, "locals");
+        Map<String, Object> hints = (Map<String, Object>) Json.path(thread, "hints");
+        if (locals != null && hints != null) {
+            hints.forEach((var, meaning) -> {
+                Object v = locals.get(var);
+                if (v != null && !String.valueOf(v).startsWith("<") && !String.valueOf(meaning).startsWith("base of") && !String.valueOf(meaning).startsWith("&")) {
+                    m.putIfAbsent(String.valueOf(meaning), v);
+                }
+            });
+        }
+        if (Json.path(thread, "shared") instanceof Map<?, ?> sh) {
+            ((Map<String, Object>) sh).forEach((k, v) -> m.put("__shared__ " + k, v));
+        }
+        return m;
+    }
+
+    @SuppressWarnings("unchecked")
+    static Map<String, Object> merged(Object thread) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        if (Json.path(thread, "locals") instanceof Map<?, ?> l) {
+            m.putAll((Map<String, Object>) l);
+        }
+        if (Json.path(thread, "shared") instanceof Map<?, ?> sh) {
+            ((Map<String, Object>) sh).forEach((k, v) -> m.put("__shared__ " + k, v));
+        }
+        if (Json.path(thread, "print") instanceof Map<?, ?> p) {
+            m.putAll((Map<String, Object>) p);
+        }
+        return m;
+    }
+
+    static String lastJsonLine(Path p) throws IOException {
+        List<String> lines = Files.readAllLines(p);
+        for (int i = lines.size() - 1; i >= 0; i--) {
+            String l = lines.get(i).trim();
+            if (l.startsWith("{")) {
+                return l.startsWith("{\"batch\"") ? l : l;
+            }
+            if (l.startsWith("TCD-JSON:")) {
+                return l.substring(9);
+            }
+        }
+        throw new IOException("no JSON report in " + p);
+    }
+
     // ------------------------------------------------------------------ memcheck
 
     static final Pattern SANITIZER_FRAME = Pattern.compile("(\\w+)\\+0x[0-9a-fA-F]+ in \\S*tornado_kernel\\.cu:(\\d+)");
@@ -664,7 +1010,8 @@ public class tcd {
         s.elements = o.elements;
         Path san = cudaTool("compute-sanitizer", null).orElseThrow(() -> new IllegalStateException("compute-sanitizer not found"));
         List<String> tools = o.tools.isEmpty() ? List.of("memcheck") : o.tools;
-        int worst = 0;
+        List<SanitizerSummary> summaries = new ArrayList<>();
+        int appRc = 0;
         for (String tool : tools) {
             List<String> cmd = new ArrayList<>(List.of(san.toString(), "--tool", tool, "--show-backtrace", "device"));
             // -lineinfo only: -G would serialize the kernel and can hide races.
@@ -674,30 +1021,60 @@ public class tcd {
             pb.environment().putAll(s.env());
             Process p = pb.start();
             SanitizerSummary summary = new SanitizerSummary(tool);
-            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+            summaries.add(summary);
+            Path logFile = s.dir.resolve("sanitizer-" + tool + ".log");
+            summary.log = logFile;
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8));
+                    Writer log = Files.newBufferedWriter(logFile)) {
                 for (String line; (line = r.readLine()) != null;) {
                     Matcher m = SANITIZER_FRAME.matcher(line);
                     String location = m.find() ? m.group(1) + ":" + m.group(2) : null;
                     String code = location == null ? null : generatedLine(s, m.group(1), Integer.parseInt(m.group(2)));
-                    summary.accept(line, location, code);
                     if (location != null) {
                         // The sanitizer names NVRTC's virtual file relative to the cwd; point at the real copy.
                         line = line.replaceFirst("in \\S*tornado_kernel\\.cu:", "in " + Matcher.quoteReplacement(s.dir.resolve("src").resolve(m.group(1) + ".cu").toString()) + ":");
                     }
+                    summary.accept(line, location, code);
+                    log.write(line + "\n");
+                    if (code != null) {
+                        log.write("=========         >> " + location + "  " + code + "\n");
+                    }
+                    PrintStream sink = o.json ? err : out;
+                    if (o.json && line.startsWith("=========")) {
+                        continue; // --json: reports go to the log and the JSON summary only
+                    }
                     if (o.verbose || !line.startsWith("=========") || summary.reported <= 3 || line.contains("SUMMARY")) {
-                        out.println(line);
+                        sink.println(line);
                         if (code != null) {
-                            out.println("=========         >> " + location + "  " + code);
+                            sink.println("=========         >> " + location + "  " + code);
                         }
                     }
                 }
             }
-            worst = Math.max(worst, p.waitFor());
-            summary.print(o.verbose);
+            appRc = Math.max(appRc, p.waitFor());
+            if (!o.json) {
+                summary.print(o.verbose);
+            }
         }
         s.close();
-        err.println("tcd: generated kernel sources: " + s.dir.resolve("src") + "/<kernel>.cu");
-        return worst;
+        int errors = summaries.stream().mapToInt(x -> x.errors).sum();
+        if (o.json) {
+            List<Object> tj = new ArrayList<>();
+            for (SanitizerSummary x : summaries) {
+                tj.add(x.toJson());
+            }
+            Map<String, Object> doc = new LinkedHashMap<>();
+            doc.put("errors", errors);
+            doc.put("tools", tj);
+            doc.put("applicationExitCode", appRc);
+            doc.put("sources", s.dir.resolve("src").toString());
+            out.println(Json.write(doc));
+        } else {
+            err.println("tcd: generated kernel sources: " + s.dir.resolve("src") + "/<kernel>.cu");
+            err.println("tcd: " + (errors == 0 ? "no sanitizer errors" : errors + " sanitizer error(s)") + (appRc != 0 ? ", application exit code " + appRc : ""));
+        }
+        // CI contract: 1 = sanitizer errors, otherwise the application's own exit code.
+        return errors > 0 ? 1 : appRc;
     }
 
     /**
@@ -705,7 +1082,7 @@ public class tcd {
      * a grid tail produces one report per thread; developers want one line per bug.
      */
     static final class SanitizerSummary {
-        static final Pattern HEADER = Pattern.compile("^========= (Invalid .*|Error: .*|Race reported.*|Uninitialized .*|Barrier error.*|Program hit .*)");
+        static final Pattern HEADER = Pattern.compile("^========= (Invalid .*|Error: .*|Warning: .*|Race reported.*|Uninitialized .*|Barrier error.*|Program hit .*)");
         static final Pattern THREAD = Pattern.compile("by thread \\((\\d+),(\\d+),(\\d+)\\) in block \\((\\d+),(\\d+),(\\d+)\\)");
         final String tool;
         final Map<String, int[]> counts = new LinkedHashMap<>();
@@ -714,12 +1091,26 @@ public class tcd {
         String kind;
         String key;
         int reported;
+        int errors;
+        int warnings;
+        Path log;
+        static final Pattern ERROR_SUMMARY = Pattern.compile("ERROR SUMMARY: (\\d+) error");
+        static final Pattern RACE_SUMMARY = Pattern.compile("RACECHECK SUMMARY: \\d+ hazards? displayed \\((\\d+) errors?, (\\d+) warnings?\\)");
 
         SanitizerSummary(String tool) {
             this.tool = tool;
         }
 
         void accept(String line, String location, String code) {
+            Matcher es = ERROR_SUMMARY.matcher(line);
+            if (es.find()) {
+                errors = Integer.parseInt(es.group(1));
+            }
+            Matcher rs = RACE_SUMMARY.matcher(line);
+            if (rs.find()) {
+                errors = Integer.parseInt(rs.group(1));
+                warnings = Integer.parseInt(rs.group(2));
+            }
             Matcher h = HEADER.matcher(line);
             if (h.find()) {
                 kind = h.group(1).replaceAll(" at \\S+\\+0x[0-9a-f]+ in \\S+", "").replaceAll("0x[0-9a-f]+", "").trim();
@@ -740,6 +1131,27 @@ public class tcd {
             }
         }
 
+        Map<String, Object> toJson() {
+            List<Object> groups = new ArrayList<>();
+            counts.forEach((k, c) -> {
+                Map<String, Object> g = new LinkedHashMap<>();
+                int at = k.lastIndexOf(" @ ");
+                g.put("kind", k.substring(0, at));
+                g.put("location", k.substring(at + 3));
+                g.put("code", codeOf.get(k));
+                g.put("count", c[0]);
+                g.put("first", firstThread.get(k));
+                groups.add(g);
+            });
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("tool", tool);
+            m.put("errors", errors);
+            m.put("warnings", warnings);
+            m.put("groups", groups);
+            m.put("log", String.valueOf(log));
+            return m;
+        }
+
         void print(boolean verbose) {
             if (!verbose && reported > 3) {
                 out.println("========= (" + (reported - 3) + " more reports hidden; --verbose shows all)");
@@ -754,8 +1166,8 @@ public class tcd {
                     out.println("             code:  " + codeOf.get(k));
                 }
                 if (firstThread.get(k) != null) {
-                    out.println("             first: " + firstThread.get(k) + "   -> tcd batch -b " + k.substring(k.lastIndexOf("@ ") + 2) + " --at "
-                            + firstThread.get(k).replaceAll("block \\(([\\d,]+)\\) thread \\(([\\d,]+)\\)", "$1:$2"));
+                    out.println("             first: " + firstThread.get(k) + "   -> tcd batch -b " + k.substring(k.lastIndexOf("@ ") + 2) + "@"
+                            + firstThread.get(k).replaceAll("block \\(([\\d,]+)\\) thread \\(([\\d,]+)\\)", "$1:$2").replace(",0,0", "") + " -- ...");
                 }
             });
         }
@@ -1182,7 +1594,8 @@ public class tcd {
                 if (b.containsKey("delete")) {
                     r = mi.command("-break-delete " + ((Number) b.get("delete")).intValue());
                 } else {
-                    String spec = b.get("kernel") + (b.get("line") != null ? ":" + ((Number) b.get("line")).intValue() : "");
+                    String spec = b.get("spec") != null ? String.valueOf(b.get("spec"))
+                            : b.get("kernel") + (b.get("line") != null ? ":" + ((Number) b.get("line")).intValue() : "");
                     r = mi.console("tcd-break " + spec);
                 }
                 json(ex, Map.of("ok", r.ok(), "message", r.ok() ? r.console() : r.message(), "breakpoints", breakpoints()));
@@ -1223,6 +1636,11 @@ public class tcd {
                 st.put("where", where);
                 if (Boolean.TRUE.equals(Json.path(where, "device"))) {
                     st.put("threads", jsonFrom(mi.console("tcd-snapshot").console(), "snapshot"));
+                    Object srcPath = Json.path(where, "source");
+                    if (srcPath != null) {
+                        st.put("arrays", jsonFrom(mi.console("python print('TCD-JSON:' + json.dumps({'arrays': array_args(analyze_source(" + Json.quote(srcPath.toString())
+                                + ")[1])}))").console(), "arrays"));
+                    }
                     st.put("cudaKernels", mi.console("info cuda kernels").console());
                     st.put("warps", mi.console("info cuda warps").console());
                     Object src = Json.path(where, "source");
@@ -1314,6 +1732,365 @@ public class tcd {
 
         void stop() {
             server.stop(0);
+        }
+    }
+
+    // ------------------------------------------------------------------ DAP (IDE integration)
+
+    /**
+     * Debug Adapter Protocol server over stdin/stdout, backed by the same GDB/MI driver as the web UI.
+     * One DAP "thread" represents the CUDA focus. Switch it from the debug console with
+     * `cuda block (x,y,z) thread (x,y,z)`. Breakpoints go on the generated sources, which the adapter
+     * reports as sessions/<ts>/src/<kernel>/tornado_kernel.cu, with or without a condition.
+     */
+    static final class Dap {
+        final Options opts;
+        final OutputStream wire;
+        final AtomicInteger seq = new AtomicInteger(1);
+        Mi mi;
+        Session session;
+        final Map<String, List<Integer>> bpsBySource = new ConcurrentHashMap<>();
+        final Map<Integer, Object> varRefs = new ConcurrentHashMap<>();
+        final AtomicInteger nextRef = new AtomicInteger(100);
+        volatile Object lastWhere;
+        volatile boolean terminated;
+
+        Dap(Options o, OutputStream wire) {
+            this.opts = o;
+            this.wire = wire;
+        }
+
+        static int serve(Options o) throws Exception {
+            OutputStream wire = new java.io.FileOutputStream(java.io.FileDescriptor.out);
+            System.setOut(System.err); // stdout carries only DAP messages; anything else goes to stderr
+            Dap d = new Dap(o, wire);
+            d.loop(new java.io.BufferedInputStream(System.in));
+            return 0;
+        }
+
+        void loop(InputStream in) throws IOException {
+            while (!terminated) {
+                int length = -1;
+                String header;
+                while ((header = readLine(in)) != null && !header.isEmpty()) {
+                    if (header.toLowerCase().startsWith("content-length:")) {
+                        length = Integer.parseInt(header.substring(15).trim());
+                    }
+                }
+                if (header == null || length < 0) {
+                    break;
+                }
+                byte[] body = in.readNBytes(length);
+                Object msg = Json.parse(new String(body, StandardCharsets.UTF_8));
+                try {
+                    handle(msg);
+                } catch (Exception e) {
+                    respond(msg, false, e.toString(), null);
+                }
+            }
+            if (mi != null) {
+                mi.destroy();
+            }
+            if (session != null) {
+                session.close();
+            }
+        }
+
+        static String readLine(InputStream in) throws IOException {
+            StringBuilder b = new StringBuilder();
+            for (int c; (c = in.read()) != -1;) {
+                if (c == '\n') {
+                    return b.toString().replace("\r", "");
+                }
+                b.append((char) c);
+            }
+            return b.isEmpty() ? null : b.toString();
+        }
+
+        synchronized void send(Map<String, Object> m) {
+            m.put("seq", seq.getAndIncrement());
+            byte[] body = Json.write(m).getBytes(StandardCharsets.UTF_8);
+            try {
+                wire.write(("Content-Length: " + body.length + "\r\n\r\n").getBytes(StandardCharsets.US_ASCII));
+                wire.write(body);
+                wire.flush();
+            } catch (IOException e) {
+                terminated = true;
+            }
+        }
+
+        void respond(Object req, boolean ok, String message, Object body) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("type", "response");
+            m.put("request_seq", Json.path(req, "seq"));
+            m.put("success", ok);
+            m.put("command", Json.path(req, "command"));
+            if (message != null) {
+                m.put("message", message);
+            }
+            if (body != null) {
+                m.put("body", body);
+            }
+            send(m);
+        }
+
+        void event(String name, Object body) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("type", "event");
+            m.put("event", name);
+            if (body != null) {
+                m.put("body", body);
+            }
+            send(m);
+        }
+
+        void output(String category, String text) {
+            event("output", Map.of("category", category, "output", text.endsWith("\n") ? text : text + "\n"));
+        }
+
+        @SuppressWarnings("unchecked")
+        void handle(Object req) throws Exception {
+            String cmd = String.valueOf(Json.path(req, "command"));
+            Map<String, Object> args = Json.path(req, "arguments") instanceof Map<?, ?> a ? (Map<String, Object>) a : Map.of();
+            switch (cmd) {
+                case "initialize" -> respond(req, true, null, Map.of("supportsConfigurationDoneRequest", true, "supportsConditionalBreakpoints", true,
+                        "supportsEvaluateForHovers", true, "supportsTerminateRequest", true));
+                case "launch", "attach" -> {
+                    launch(cmd, args);
+                    respond(req, true, null, null);
+                    event("initialized", null);
+                }
+                case "setBreakpoints" -> respond(req, true, null, Map.of("breakpoints", setBreakpoints(args)));
+                case "setExceptionBreakpoints", "setFunctionBreakpoints" -> respond(req, true, null, Map.of("breakpoints", List.of()));
+                case "configurationDone" -> {
+                    respond(req, true, null, null);
+                    if (!"attach".equals(mode)) {
+                        mi.command("-exec-run");
+                    } else {
+                        mi.command("-exec-continue");
+                    }
+                }
+                case "threads" -> respond(req, true, null, Map.of("threads", List.of(Map.of("id", 1, "name", threadName()))));
+                case "stackTrace" -> respond(req, true, null, stackTrace());
+                case "scopes" -> respond(req, true, null, Map.of("scopes", scopes()));
+                case "variables" -> respond(req, true, null, Map.of("variables", variables(((Number) args.get("variablesReference")).intValue())));
+                case "continue" -> {
+                    mi.command("-exec-continue");
+                    respond(req, true, null, Map.of("allThreadsContinued", true));
+                }
+                case "next" -> control(req, "-exec-next");
+                case "stepIn" -> control(req, "-exec-step");
+                case "stepOut" -> control(req, "-exec-finish");
+                case "pause" -> {
+                    mi.interrupt();
+                    respond(req, true, null, null);
+                }
+                case "evaluate" -> respond(req, true, null, evaluate(String.valueOf(args.get("expression")), String.valueOf(args.get("context"))));
+                case "disconnect", "terminate" -> {
+                    if ("attach".equals(mode)) {
+                        mi.console("detach");
+                    }
+                    respond(req, true, null, null);
+                    terminated = true;
+                    event("terminated", null);
+                }
+                default -> respond(req, false, "unsupported request " + cmd, null);
+            }
+        }
+
+        String mode = "launch";
+
+        /** launch: {args: [java args], tornadoHome?, stopOnKernel?: [..], noFastStart?}; attach: {pid}. */
+        @SuppressWarnings("unchecked")
+        void launch(String how, Map<String, Object> args) throws Exception {
+            mode = how;
+            Options o = opts;
+            if (args.get("tornadoHome") != null) {
+                o.tornadoHome = String.valueOf(args.get("tornadoHome"));
+            }
+            if (Boolean.TRUE.equals(args.get("noFastStart"))) {
+                o.fastStart = false;
+            }
+            List<String> cmd = gdbBase(o, true);
+            Map<String, String> env;
+            if (how.equals("attach")) {
+                long pid = ((Number) args.get("pid")).longValue();
+                env = launchedEnv(pid);
+                cmd.addAll(List.of("-p", String.valueOf(pid)));
+            } else {
+                o.appArgs = new ArrayList<>((List<String>) args.getOrDefault("args", List.of()));
+                session = new Session(tornadoHome(o), o.keep);
+                env = session.env();
+                cmd.add("--args");
+                cmd.addAll(session.javaCommand(o, "-G -lineinfo"));
+            }
+            Path sessionDir = Path.of(env.get("TCD_SESSION"));
+            mi = new Mi(cmd, env, sessionDir.resolve("dap-mi.log"));
+            mi.command("-gdb-set mi-async on");
+            for (Object k : (List<Object>) args.getOrDefault("stopOnKernel", List.of())) {
+                mi.console("tcd-break " + k);
+            }
+            mi.on((type, payload) -> {
+                switch (type) {
+                    case "stopped" -> {
+                        varRefs.clear();
+                        String reason = String.valueOf(Json.path(payload, "reason"));
+                        event("stopped", Map.of("reason", reason.contains("breakpoint") ? "breakpoint" : reason.contains("step") || reason.contains("end-stepping") ? "step" : "pause",
+                                "threadId", 1, "allThreadsStopped", true));
+                    }
+                    case "running" -> event("continued", Map.of("threadId", 1, "allThreadsContinued", true));
+                    case "exited" -> {
+                        event("exited", Map.of("exitCode", toInt(Json.path(payload, "exit-code")) < 0 ? 0 : toInt(Json.path(payload, "exit-code"))));
+                        event("terminated", null);
+                    }
+                    case "program" -> output("stdout", String.valueOf(payload));
+                    case "console" -> {
+                        String t = String.valueOf(payload);
+                        if (!t.startsWith("TCD-JSON:") && !t.startsWith("[New Thread") && !t.contains("exited]")) {
+                            output("console", t);
+                        }
+                    }
+                    default -> {
+                    }
+                }
+            });
+            output("console", "tcd: session " + sessionDir + ". Switch GPU thread in the debug console: cuda block (x,y,z) thread (x,y,z)");
+        }
+
+        void control(Object req, String mic) {
+            Mi.Result r = mi.command(mic);
+            respond(req, r.ok(), r.ok() ? null : r.message(), null);
+        }
+
+        /** Kernel of a source path: .../src/<kernel>/tornado_kernel.cu or .../<kernel>.cu */
+        static String kernelOf(String path) {
+            Path p = Path.of(path);
+            String f = p.getFileName().toString();
+            if (f.equals("tornado_kernel.cu") && p.getParent() != null) {
+                return p.getParent().getFileName().toString();
+            }
+            return f.replaceFirst("\\.(cu|cl)$", "").replaceFirst("^.*-", "");
+        }
+
+        @SuppressWarnings("unchecked")
+        List<Object> setBreakpoints(Map<String, Object> args) {
+            String path = String.valueOf(Json.path(args.get("source"), "path"));
+            String kernel = kernelOf(path);
+            for (Integer n : bpsBySource.getOrDefault(path, List.of())) {
+                mi.command("-break-delete " + n);
+            }
+            List<Integer> numbers = new ArrayList<>();
+            List<Object> result = new ArrayList<>();
+            for (Object b : (List<Object>) args.getOrDefault("breakpoints", List.of())) {
+                int line = toInt(Json.path(b, "line"));
+                Object cond = Json.path(b, "condition");
+                Mi.Result r = mi.console("tcd-break " + kernel + ":" + line + (cond == null || cond.toString().isBlank() ? "" : " if " + cond));
+                Matcher m = Pattern.compile("breakpoint (\\d+)").matcher(r.console());
+                boolean ok = r.ok() && m.find();
+                if (ok) {
+                    numbers.add(Integer.parseInt(m.group(1)));
+                }
+                Map<String, Object> v = new LinkedHashMap<>();
+                v.put("verified", ok);
+                v.put("line", line);
+                v.put("message", ok ? "kernel " + kernel + " (resolves when the kernel is JIT-compiled)" : r.message());
+                result.add(v);
+            }
+            bpsBySource.put(path, numbers);
+            return result;
+        }
+
+        String threadName() {
+            Object f = Json.path(lastWhere, "focus");
+            return f == null ? "GPU (CUDA focus)" : "GPU block " + coord(Json.path(f, "block")) + " thread " + coord(Json.path(f, "thread"));
+        }
+
+        Map<String, Object> stackTrace() {
+            Object w = Web.jsonFrom(mi.console("tcd-where").console(), "where");
+            lastWhere = w;
+            List<Object> frames = new ArrayList<>();
+            if (Boolean.TRUE.equals(Json.path(w, "device"))) {
+                String kernel = String.valueOf(Json.path(w, "function"));
+                Map<String, Object> f = new LinkedHashMap<>();
+                f.put("id", 1);
+                f.put("name", kernel + " @ block " + coord(Json.path(Json.path(w, "focus"), "block")) + " thread " + coord(Json.path(Json.path(w, "focus"), "thread")));
+                f.put("line", toInt(Json.path(w, "line")));
+                f.put("column", 1);
+                if (Json.path(w, "source") != null) {
+                    f.put("source", Map.of("name", kernel + ".cu", "path", String.valueOf(Json.path(w, "source"))));
+                }
+                frames.add(f);
+            } else {
+                frames.add(Map.of("id", 1, "name", "host (JVM) - not in a kernel", "line", 0, "column", 0));
+            }
+            return Map.of("stackFrames", frames, "totalFrames", frames.size());
+        }
+
+        List<Object> scopes() {
+            Object snap = Web.jsonFrom(mi.console("tcd-snapshot").console(), "snapshot");
+            Object thread = snap instanceof List<?> l && !l.isEmpty() ? l.get(0) : Map.of();
+            int locals = ref(Map.of("kind", "locals", "thread", thread));
+            int shared = ref(Map.of("kind", "shared", "thread", thread));
+            int cuda = ref(Map.of("kind", "cuda"));
+            return List.of(Map.of("name", "Locals", "variablesReference", locals, "expensive", false),
+                    Map.of("name", "__shared__", "variablesReference", shared, "expensive", false),
+                    Map.of("name", "Arrays / CUDA", "variablesReference", cuda, "expensive", true));
+        }
+
+        int ref(Object o) {
+            int r = nextRef.getAndIncrement();
+            varRefs.put(r, o);
+            return r;
+        }
+
+        @SuppressWarnings("unchecked")
+        List<Object> variables(int ref) {
+            Object scope = varRefs.get(ref);
+            List<Object> out = new ArrayList<>();
+            String kind = String.valueOf(Json.path(scope, "kind"));
+            if (kind.equals("locals") || kind.equals("shared")) {
+                Object t = Json.path(scope, "thread");
+                Map<String, Object> vals = (Map<String, Object>) Json.path(t, kind);
+                Map<String, Object> hints = (Map<String, Object>) Json.path(t, "hints");
+                if (vals != null) {
+                    List<String> names = new ArrayList<>(vals.keySet());
+                    names.sort(tcd::naturalOrder);
+                    for (String n : names) {
+                        Object hint = hints == null ? null : hints.get(n);
+                        Map<String, Object> v = new LinkedHashMap<>();
+                        v.put("name", n);
+                        v.put("value", String.valueOf(vals.get(n)) + (hint == null ? "" : "    ← " + hint));
+                        v.put("variablesReference", 0);
+                        if (hint != null) {
+                            v.put("type", String.valueOf(hint));
+                        }
+                        out.add(v);
+                    }
+                }
+            } else if (kind.equals("cuda")) {
+                String where = String.valueOf(Json.path(lastWhere, "source"));
+                Mi.Result arrays = mi.console("python print('TCD-JSON:' + json.dumps({'arrays': array_args(analyze_source(" + Json.quote(where) + ")[1])}))");
+                Object a = Web.jsonFrom(arrays.console(), "arrays");
+                if (a instanceof Map<?, ?> m) {
+                    m.forEach((k, v) -> out.add(Map.of("name", String.valueOf(k), "value", String.valueOf(v), "variablesReference", 0)));
+                }
+                out.add(Map.of("name", "info cuda kernels", "value", mi.console("info cuda kernels").console().trim(), "variablesReference", 0));
+            }
+            return out;
+        }
+
+        Map<String, Object> evaluate(String expr, String context) {
+            if ("repl".equals(context)) {
+                Mi.Result r = mi.console(expr);
+                if (expr.startsWith("cuda ") && r.ok()) {
+                    // Focus changed: refresh the IDE's views.
+                    varRefs.clear();
+                    event("stopped", Map.of("reason", "focus", "threadId", 1, "allThreadsStopped", true, "description", "CUDA focus changed"));
+                }
+                return Map.of("result", r.ok() ? r.console().stripTrailing() : r.message(), "variablesReference", 0);
+            }
+            Mi.Result r = mi.command("-data-evaluate-expression " + Json.quote(expr));
+            return Map.of("result", r.ok() ? String.valueOf(Json.path(r.value(), "value")) : r.message(), "variablesReference", 0);
         }
     }
 

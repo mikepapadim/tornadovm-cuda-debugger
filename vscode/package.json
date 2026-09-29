@@ -1,0 +1,50 @@
+{
+  "name": "tornadovm-cuda-debug",
+  "displayName": "TornadoVM CUDA Debugger (tcd)",
+  "description": "Debug TornadoVM CUDA kernels with cuda-gdb: GPU breakpoints, per-thread locals with their Java meaning, shared memory and TornadoVM arrays.",
+  "version": "0.2.0",
+  "publisher": "mikepapadim",
+  "license": "Apache-2.0",
+  "engines": { "vscode": "^1.80.0" },
+  "categories": ["Debuggers"],
+  "main": "./extension.js",
+  "activationEvents": ["onDebugResolve:tornadovm-cuda", "onDebugDynamicConfigurations:tornadovm-cuda"],
+  "contributes": {
+    "configuration": {
+      "title": "TornadoVM CUDA Debugger",
+      "properties": {
+        "tornadovmCuda.tcdPath": { "type": "string", "default": "tcd", "description": "Path to the tcd launcher (bin/tcd in the tornadovm-cuda-debugger checkout)." }
+      }
+    },
+    "breakpoints": [{ "language": "cuda-cpp" }, { "language": "cpp" }, { "language": "plaintext" }],
+    "debuggers": [
+      {
+        "type": "tornadovm-cuda",
+        "label": "TornadoVM CUDA (cuda-gdb)",
+        "languages": ["java", "cuda-cpp"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["args"],
+            "properties": {
+              "args": { "type": "array", "items": { "type": "string" }, "description": "java arguments of the application, e.g. [\"-cp\", \"target/classes\", \"com.acme.MyApp\"]" },
+              "stopOnKernel": { "type": "array", "items": { "type": "string" }, "description": "Kernels (Java method names) to stop at on entry, e.g. [\"vectorAdd\"] or [\"reduce:33@0:64\"]" },
+              "tornadoHome": { "type": "string", "description": "TornadoVM SDK (defaults to $TORNADOVM_HOME)" },
+              "noFastStart": { "type": "boolean", "default": false, "description": "Keep TornadoVM's CUDA transfer warm-up (about 20 s slower under the debugger)" }
+            }
+          },
+          "attach": {
+            "required": ["pid"],
+            "properties": { "pid": { "type": "number", "description": "PID printed by `tcd launch`" } }
+          }
+        },
+        "initialConfigurations": [
+          { "type": "tornadovm-cuda", "request": "launch", "name": "Debug TornadoVM kernel", "args": ["-cp", "target/classes", "com.acme.MyApp"], "stopOnKernel": ["myKernel"] }
+        ],
+        "configurationSnippets": [
+          { "label": "TornadoVM CUDA: launch", "body": { "type": "tornadovm-cuda", "request": "launch", "name": "Debug TornadoVM kernel", "args": ["-cp", "target/classes", "^\"${1:com.acme.MyApp}\""], "stopOnKernel": ["^\"${2:myKernel}\""] } },
+          { "label": "TornadoVM CUDA: attach", "body": { "type": "tornadovm-cuda", "request": "attach", "name": "Attach to tcd launch", "pid": 0 } }
+        ]
+      }
+    ]
+  }
+}

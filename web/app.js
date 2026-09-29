@@ -117,7 +117,8 @@ function renderBreakpoints(list) {
   for (const b of list) {
     const li = document.createElement("li");
     const label = b.kernel ? b.kernel + (b.line ? ":" + b.line : " (entry)") : b.location;
-    li.innerHTML = `<span>#${b.number} ${label}</span><span class="muted">${b.hits ? b.hits + "×" : ""} <span class="x" title="delete">✕</span></span>`;
+    li.title = b.condition ? "if " + b.condition : "";
+    li.innerHTML = `<span>#${b.number} ${label}${b.condition ? " ⧗" : ""}</span><span class="muted">${b.hits ? b.hits + "×" : ""} <span class="x" title="delete">✕</span></span>`;
     li.querySelector(".x").onclick = async () => renderBreakpoints((await api("break", { delete: b.number })).breakpoints);
     ul.appendChild(li);
   }
@@ -138,8 +139,7 @@ $("bp-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const v = $("bp-input").value.trim();
   if (!v) return;
-  const [kernel, line] = v.split(":");
-  const r = await api("break", line ? { kernel, line: +line } : { kernel });
+  const r = await api("break", { spec: v }); // kernel[:line][@block:thread][ if cond]
   if (r.message) log(r.message.trim(), r.ok ? "" : "err");
   renderBreakpoints(r.breakpoints);
   $("bp-input").value = "";
@@ -147,7 +147,7 @@ $("bp-form").addEventListener("submit", async (e) => {
 
 // ---------------------------------------------------------------- state after a stop
 
-function renderKV(table, obj, prev, removable) {
+function renderKV(table, obj, prev, removable, hints) {
   table.innerHTML = "";
   const keys = Object.keys(obj || {}).filter((k) => !k.startsWith("_"))
     .sort((a, b) => (+(a.match(/_(\d+)$/) || [0, -1])[1]) - (+(b.match(/_(\d+)$/) || [0, -1])[1]) || a.localeCompare(b));
@@ -157,6 +157,11 @@ function renderKV(table, obj, prev, removable) {
     tr.innerHTML = `<td></td><td></td>`;
     tr.children[0].textContent = k;
     tr.children[1].textContent = obj[k];
+    if (hints && hints[k]) {
+      const h = document.createElement("span");
+      h.className = "vhint"; h.textContent = hints[k];
+      tr.children[1].appendChild(h);
+    }
     if (removable) {
       const x = document.createElement("span");
       x.className = "x"; x.textContent = "✕"; x.onclick = () => removable(k);
@@ -184,7 +189,9 @@ async function refresh() {
     ["bx", "by", "bz"].forEach((id, i) => ($(id).value = f.block[i]));
     ["tx", "ty", "tz"].forEach((id, i) => ($(id).value = f.thread[i]));
     const t = Array.isArray(s.threads) && s.threads[0] ? s.threads[0] : {};
-    renderKV($("locals"), t.locals, state.prevLocals);
+    renderKV($("locals"), t.locals, state.prevLocals, null, t.hints);
+    renderKV($("arrays"), s.arrays || {});
+    $("line-meaning").textContent = t.meaning ? "Java: " + t.meaning : "";
     renderKV($("shared"), t.shared);
     state.prevLocals = t.locals || {};
     $("warps").textContent = s.warps || "";

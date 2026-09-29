@@ -30,18 +30,18 @@
     <section>
       <h2>Breakpoints</h2>
       <form id="bp-form" class="row">
-        <input id="bp-input" placeholder="kernel or kernel:line" autocomplete="off">
+        <input id="bp-input" placeholder="kernel[:line][@block:thread][ if cond]" autocomplete="off">
         <button type="submit">Add</button>
       </form>
       <ul id="breakpoints" class="list"></ul>
-      <p class="hint">A kernel is named after its Java method. Break on its entry before running, then click a line number in the source.</p>
+      <p class="hint">A kernel is named after its Java method. Break on its entry before running, then click a line number in the source. <code>reduce:33@0:64</code> stops only in block 0, thread 64. <code>reduce:33 if i_10 == 8</code> uses a per-thread condition.</p>
     </section>
   </aside>
 
   <section class="center">
     <div class="source-head">
       <span id="src-title">No kernel stopped</span>
-      <span id="src-where" class="muted"></span>
+      <span><span id="line-meaning" class="meaning"></span> <span id="src-where" class="muted"></span></span>
     </div>
     <div id="source" class="source"><div class="empty">
       <p>Set a breakpoint on a kernel (for example <code>add</code>), then press <b>Run</b>.</p>
@@ -62,6 +62,10 @@
     <section>
       <h2>Locals <span class="muted small">· changed values highlighted</span></h2>
       <table id="locals" class="kv"></table>
+    </section>
+    <section>
+      <h2>Array arguments</h2>
+      <table id="arrays" class="kv"></table>
     </section>
     <section>
       <h2>__shared__</h2>

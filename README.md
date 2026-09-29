@@ -24,11 +24,22 @@ named after its Java method. Lines are lines of the generated CUDA C. `--at B:T`
 |---|---|
 | `doctor` | checks cuda-gdb, the driver, the SDK and permissions |
 | `run` | interactive cuda-gdb, set up for the JVM (`--tui` for the TUI) |
-| `batch` | runs to a breakpoint and prints locals, `__shared__` and `-p` expressions per thread (`--json`) |
-| `memcheck` | compute-sanitizer (`--tool memcheck\|racecheck\|initcheck\|synccheck`), with reports mapped to generated lines and grouped |
+| `batch` | runs to a breakpoint and prints locals (with their Java meaning), `__shared__`, array arguments and the locals that differ between threads (`--json`) |
+| `memcheck` | compute-sanitizer (`--tool memcheck\|racecheck\|initcheck\|synccheck`), with reports mapped to generated lines and grouped. Exits 1 on errors (CI); `--json` gives a summary |
 | `ui` | web debugger on `127.0.0.1:7777`: breakpoints, F5/F10/F11, thread focus, locals, shared memory, arrays, warps |
+| `dap` | Debug Adapter Protocol server, used by the [VS Code extension](vscode/) (and IntelliJ + LSP4IJ) |
+| `launch` / `attach PID` | start a long-running app with debug kernels, then attach to it (and detach) whenever you like; `batch --pid PID` takes a snapshot |
+| `diff A.json B.json` | compare two `batch --json` reports thread by thread (the same kernel with different inputs, or buggy against fixed) |
 
-Inside cuda-gdb: `tcd-break K[:L]`, `tcd-list`, `tcd-array arg1 float 0 16`, `tcd-shared adf_2 float`.
+**Breakpoints:** `-b K`, `-b K:L`, `-b K:L@B:T` (only block B, thread T), `-b "K:L if i_10 == 8"` (a condition evaluated per GPU thread).
+Inside cuda-gdb: `tcd-break`, `tcd-list`, `tcd-array arg1 float 0 16`, `tcd-shared adf_2 float`.
+
+**Readable locals:** tcd recognises TornadoVM's code patterns, so `f_8 = 67` is shown as `arg1[ctx.globalIdx]` and
+`i_9` as `ctx.localIdx`. `argN` is the N-th Java parameter counting from 0, so with a `KernelContext` first,
+the first array is `arg1`.
+
+**Speed:** a debug session starts in about 2 s. tcd's agent skips TornadoVM's CUDA transfer warm-up, about 5,000 driver
+calls that are free natively but take about 20 s under cuda-gdb (`--no-fast-start` keeps it).
 
 ## Use it on your own TornadoVM kernel
 
@@ -44,8 +55,8 @@ new TaskGraph("s0").task("t0", MyApp::vectorAdd, ctx, a, b, c) ...
 ```
 
 1. **Build your app as usual**, whether with Maven, Gradle or `javac`. Nothing in your code changes, and the tornado jars come from the SDK.
-2. **The kernel name is the Java method name:** `vectorAdd`. Arguments that are not a `KernelContext` become
-   `arg1`, `arg2`, … in the generated code.
+2. **The kernel name is the Java method name:** `vectorAdd`. Parameters become `arg0`, `arg1`, … by position,
+   so `a` is `arg1` here, because `ctx` is `arg0`.
 3. **Check for memory errors and races across the whole grid:**
    ```bash
    bin/tcd memcheck -- -cp target/classes com.acme.MyApp               # out-of-bounds, bad addresses
@@ -64,18 +75,33 @@ new TaskGraph("s0").task("t0", MyApp::vectorAdd, ctx, a, b, c) ...
 5. **Script it, or hand it to an agent:** `bin/tcd batch -b vectorAdd:17 --at 3:7 --json -- -cp target/classes com.acme.MyApp`.
    Or use `bin/tcd ui …` and click line numbers to set breakpoints.
 
-Use a small problem size, because debug builds (`-G`) are slow. Application arguments go after the main
+Use a small problem size, because debug builds (`-G`) are slow.
+Installing with jbang: `jbang app install tcd@mikepapadim/tornadovm-cuda-debugger` (while the repo is private, this needs access to it). Application arguments go after the main
 class, as usual. `@Parallel` loop kernels work the same way (the generated code is a grid-stride loop).
 
 **Examples:** a missing barrier and a silent out-of-bounds write, each found and fixed step
 by step. See [docs/examples.md](docs/examples.md).
+
+## IDE and CI
+
+- **VS Code:** `vscode/` holds a small extension that runs `tcd dap`. Add a `tornadovm-cuda` launch configuration
+  with `"args": ["-cp", "target/classes", "com.acme.MyApp"], "stopOnKernel": ["vectorAdd"]`. The generated
+  CUDA C opens at the kernel entry. Set breakpoints in the gutter (conditions work too) and switch GPU thread
+  from the Debug Console with `cuda block (2,0,0) thread (5,0,0)`. For IntelliJ, point LSP4IJ's DAP client at `bin/tcd dap`.
+- **CI** (self-hosted GPU runner): `bin/tcd memcheck --tool racecheck --tool memcheck --json -- -cp … my.Tests`
+  exits 1 on any sanitizer error, and its JSON lists every failing kernel line.
 
 ## How it works
 
 - Kernels are compiled with `-G -lineinfo` through `tornado.cuda.compiler.flags`, with the cubin cache disabled.
 - The generated sources are dumped, and each device stop maps `tornado_kernel.cu` (the name NVRTC gives every kernel) to the right kernel.
 - `gdb/tornado.gdbinit` passes through the signals HotSpot uses internally, and `tcd-break` only ever fires in device code.
-- `tcd ui` drives `cuda-gdb --interpreter=mi3` behind the JDK's HTTP server. There are no dependencies beyond a JDK.
+- `tcd ui` and `tcd dap` drive `cuda-gdb --interpreter=mi3`. The UI is served by the JDK's HTTP server. There are no dependencies beyond a JDK.
+- The start-up agent (`agent/TcdAgent.java`) is compiled on first use against the SDK's ASM. For `tcd launch` it also calls
+  `prctl(PR_SET_PTRACER)` so cuda-gdb can attach under Yama `ptrace_scope=1`.
+
+Conditional breakpoints are evaluated by cuda-gdb for every warp that reaches the line: about 35 ms per block
+before the target on an RTX 4090. A thread near the end of a large grid can take minutes to reach, so use a small problem size.
 
 ## Claude Code skill
 

@@ -1,3 +1,4 @@
 examples/classes/
 .tcd-session/
 *.log
+*.vsix

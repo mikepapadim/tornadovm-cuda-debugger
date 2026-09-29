@@ -1,0 +1,8 @@
+{
+  "aliases": {
+    "tcd": {
+      "script-ref": "tcd.java",
+      "description": "Debug TornadoVM CUDA kernels with cuda-gdb and compute-sanitizer"
+    }
+  }
+}

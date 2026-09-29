@@ -180,6 +180,145 @@ explicit @shared cast: ((@shared T*)&'kernel::name')[0]@n."""
     return out
 
 
+# ---------------------------------------------------------------- generated-code hints
+#
+# TornadoVM's CUDA C is SSA-like: every Java expression becomes a chain of tiny assignments.
+# These rules recover the Java meaning of the common chains, so a local reads
+# "f_8 = 67  (arg1[ctx.globalIdx])" instead of just "f_8 = 67".
+
+_BUILTINS = {
+    "(blockIdx.x*blockDim.x+threadIdx.x)": "ctx.globalIdx",
+    "(blockIdx.y*blockDim.y+threadIdx.y)": "ctx.globalIdy",
+    "(blockIdx.z*blockDim.z+threadIdx.z)": "ctx.globalIdz",
+    "(threadIdx.x)": "ctx.localIdx", "(threadIdx.y)": "ctx.localIdy", "(threadIdx.z)": "ctx.localIdz",
+    "(blockIdx.x)": "ctx.groupIdx", "(blockIdx.y)": "ctx.groupIdy", "(blockIdx.z)": "ctx.groupIdz",
+    "(blockDim.x)": "ctx.localGroupSizeX", "(blockDim.y)": "ctx.localGroupSizeY",
+    "(gridDim.x*blockDim.x)": "ctx.globalGroupSizeX (grid stride)",
+    "(gridDim.y*blockDim.y)": "ctx.globalGroupSizeY (grid stride)",
+}
+_ASSIGN_RE = re.compile(r"^\s*(\w+)\s*=\s*(.+?);\s*$")
+_STORE_RE = re.compile(r"^\s*\*\(\(\s*([\w ]+?)\s*\*\)\s*(\w+)\)\s*=\s*(\w+);")
+_LOAD_RE = re.compile(r"^\*\(\(\s*([\w ]+?)\s*\*\)\s*(\w+)\)$")
+_CAST_RE = re.compile(r"^\((?:unsigned )?(?:long long|int|long|short|char|float|double)\)\s*(\w+)$")
+_ADD_RE = re.compile(r"^(\w+)\s*\+\s*(\d+)L?$")
+_SHL_RE = re.compile(r"^(\w+)\s*<<\s*(\d+)$")
+_SUM_RE = re.compile(r"^(\w+)\s*\+\s*(\w+)$")
+_SHARED_READ_RE = re.compile(r"^(adf|adi|adl|adb|adh|ads)_\d+\[(\w+)\]$")
+_ARRAY_HEADER = int(os.environ.get("TCD_ARRAY_HEADER", "16"))
+
+
+def analyze_source(path):
+    """Returns (hints {var: java-ish meaning}, arrays {argN: element C type}, lines {line: meaning})."""
+    try:
+        with open(path) as f:
+            text = f.read().splitlines()
+    except (OSError, TypeError):
+        return {}, {}, {}
+    sym = {}      # var -> ("text", str) | ("arg", n) | ("add", v, k) | ("shl", v, k) | ("addr", n, off) | ("alias", v)
+    hints, arrays, lines = {}, {}, {}
+
+    def root(v):
+        seen = 0
+        while v in sym and sym[v][0] == "alias" and seen < 50:
+            v, seen = sym[v][1], seen + 1
+        return v
+
+    def name(v):
+        r = root(v)
+        t = sym.get(r)
+        return t[1] if t and t[0] == "text" else r
+
+    def element(n, off):
+        """off is the byte offset symbol inside argN; returns index text when it is (idx + H) << k."""
+        o = sym.get(off)
+        if o and o[0] == "alias":
+            o = sym.get(root(off))
+        if o and o[0] == "shl":
+            inner = sym.get(o[1]) or sym.get(root(o[1]))
+            if inner and inner[0] == "add" and (inner[2] << o[2]) == _ARRAY_HEADER:
+                return name(inner[1])
+        if o and o[0] == "add" and o[2] == _ARRAY_HEADER:
+            return name(o[1])
+        return None
+
+    for no, line in enumerate(text, 1):
+        st = _STORE_RE.match(line)
+        if st:
+            ctype, ptr, val = st.groups()
+            p = sym.get(root(ptr))
+            if p and p[0] == "addr":
+                idx = element(p[1], p[2])
+                arrays["arg%d" % p[1]] = ctype
+                if idx:
+                    lines[no] = "arg%d[%s] = %s" % (p[1], idx, name(val))
+            continue
+        m = _ASSIGN_RE.match(line)
+        if not m:
+            continue
+        var, rhs = m.group(1), m.group(2).strip()
+        if rhs in _BUILTINS:
+            sym[var] = ("text", _BUILTINS[rhs])
+            hints[var] = _BUILTINS[rhs]
+            continue
+        c = _CAST_RE.match(rhs)
+        if c:
+            src = c.group(1)
+            if src.startswith("arg"):
+                n = int(src[3:])
+                sym[var] = ("arg", n)
+                hints[var] = "base of arg%d" % n
+            else:
+                sym[var] = ("alias", src)
+                if name(src) != root(src) or src in hints:
+                    hints[var] = hints.get(root(src), name(src))
+            continue
+        a = _ADD_RE.match(rhs)
+        if a:
+            sym[var] = ("add", a.group(1), int(a.group(2)))
+            continue
+        sh = _SHL_RE.match(rhs)
+        if sh:
+            sym[var] = ("shl", sh.group(1), int(sh.group(2)))
+            continue
+        sm = _SUM_RE.match(rhs)
+        if sm:
+            b, off = sm.groups()
+            if sym.get(root(b), ("",))[0] == "arg":
+                sym[var] = ("addr", sym[root(b)][1], off)
+                idx = element(sym[root(b)][1], off)
+                if idx:
+                    hints[var] = "&arg%d[%s]" % (sym[root(b)][1], idx)
+            continue
+        ld = _LOAD_RE.match(rhs)
+        if ld:
+            ctype, ptr = ld.groups()
+            p = sym.get(root(ptr))
+            if p and p[0] == "addr":
+                arrays["arg%d" % p[1]] = ctype
+                idx = element(p[1], p[2])
+                if idx:
+                    hints[var] = "arg%d[%s]" % (p[1], idx)
+                    lines[no] = "%s = arg%d[%s]" % (var, p[1], idx)
+            continue
+        sr = _SHARED_READ_RE.match(rhs)
+        if sr:
+            hints[var] = "%s[%s] (__shared__)" % (rhs.split("[")[0], name(sr.group(2)))
+    return hints, arrays, lines
+
+
+def array_args(arrays, count=None):
+    """First elements of every array argument whose element type is known from its loads/stores."""
+    out = {}
+    count = count or min(MAX_ELEMENTS, 16)
+    for arg, ctype in sorted(arrays.items()):
+        try:
+            r = read_array(arg, ctype, 0, count)
+            out["%s (%s[])" % (arg, ctype)] = "{" + ", ".join(r["values"]) + (", ...}" if len(r["values"]) == count else "}")
+        except gdb.error as e:
+            out[arg] = "<%s>" % e
+    return out
+
+
 def evaluate(exprs):
     out = {}
     for e in exprs:
@@ -232,12 +371,21 @@ def _on_stop(event):
 gdb.events.stop.connect(_on_stop)
 
 
+def _on_breakpoint_modified(bp):
+    # Fires on every hit (the hit count changes), so return quickly once the condition is in place.
+    if isinstance(bp, KernelBreakpoint) and bp.wanted_condition and bp.condition != bp.wanted_condition:
+        bp._apply_condition()
+
+
+gdb.events.breakpoint_modified.connect(_on_breakpoint_modified)
+
+
 # ---------------------------------------------------------------- breakpoints
 
 class KernelBreakpoint(gdb.Breakpoint):
     """Stops only when a device thread of `kernel` reaches the location."""
 
-    def __init__(self, kernel, line=None):
+    def __init__(self, kernel, line=None, condition=None):
         self.kernel = kernel
         self.kline = line
         # Both forms are scoped to the NVRTC file name, so they only resolve inside
@@ -245,11 +393,28 @@ class KernelBreakpoint(gdb.Breakpoint):
         # add in the JVM's native libraries, and each of those hits would go through stop().
         spec = "tornado_kernel.cu:%d" % line if line else "tornado_kernel.cu:" + kernel
         super().__init__(spec, internal=False)
+        # cuda-gdb evaluates a condition per GPU thread and focuses the thread that matches. On a
+        # pending breakpoint the condition cannot be parsed yet (no device symbols), so it is
+        # attached when the breakpoint resolves, which happens at module load, before any thread runs.
+        self.wanted_condition = condition
+        self._apply_condition()
+
+    def _apply_condition(self):
+        if self.wanted_condition and not self.pending and self.condition != self.wanted_condition:
+            try:
+                self.condition = self.wanted_condition
+            except gdb.error as e:
+                gdb.write("tcd: condition of breakpoint %d not usable yet: %s\n" % (self.number, e))
 
     def stop(self):
-        if cuda_focus() is None:
-            return False  # host symbol with the same name
-        if kernel_base_name(frame_function()) != self.kernel:
+        # Runs on every warp that reaches the location, before gdb evaluates any condition,
+        # so it has to stay cheap. The tornado_kernel.cu: location already restricts it to device
+        # code, so the only question left is which kernel this is, since all kernels share that file name.
+        try:
+            name = gdb.selected_frame().name()
+        except gdb.error:
+            return False
+        if kernel_base_name(name) != self.kernel:
             return False
         # Map the source now: stop() runs before gdb prints the stop location,
         # the stop event runs after it.
@@ -257,16 +422,39 @@ class KernelBreakpoint(gdb.Breakpoint):
         return True
 
 
+def _thread_condition(at):
+    """'2:5' or '2,1,0:5,3,0' -> blockIdx/threadIdx condition.
+Only the dimensions the user wrote are compared. cuda-gdb evaluates the condition on every warp that
+reaches the line, and each extra builtin comparison costs a lot (6 terms are about 5x slower than 2).
+Terms are ordered so the most selective one, the block, comes first."""
+    b, t = at.split(":")
+    bs = [v.strip() for v in b.split(",")][:3]
+    ts = [v.strip() for v in t.split(",")][:3]
+    parts = ["blockIdx.%s == %s" % (a, v) for a, v in zip("xyz", bs)] + ["threadIdx.%s == %s" % (a, v) for a, v in zip("xyz", ts)]
+    return " && ".join(parts)
+
+
 def parse_break_spec(spec):
-    if ":" in spec:
-        k, l = spec.rsplit(":", 1)
-        return k, int(l)
-    return spec, None
+    """KERNEL[:LINE][@BLOCK:THREAD][ if CONDITION] -> (kernel, line, condition)."""
+    cond = None
+    if " if " in spec:
+        spec, cond = spec.split(" if ", 1)
+        spec, cond = spec.strip(), cond.strip()
+    at = None
+    if "@" in spec:
+        spec, at = spec.split("@", 1)
+    kernel, line = (spec.rsplit(":", 1)[0], int(spec.rsplit(":", 1)[1])) if ":" in spec else (spec, None)
+    if at:
+        tc = _thread_condition(at)
+        cond = "(%s) && (%s)" % (tc, cond) if cond else tc
+    return kernel, line, cond
 
 
 class TcdBreak(gdb.Command):
-    """tcd-break KERNEL[:LINE] - break in a TornadoVM kernel (device code only).
-LINE is a line of the generated CUDA C source (see tcd-list or the dumped .cl file)."""
+    """tcd-break KERNEL[:LINE][@B:T][ if COND] - break in a TornadoVM kernel (device code only).
+LINE is a line of the generated CUDA C (see tcd-list). @2:5 stops only in block 2, thread 5
+(3-D: @2,0,0:5,1,0). COND is any cuda-gdb condition, evaluated per GPU thread,
+e.g. "tcd-break reduce:33 if i_10 == 8"."""
 
     def __init__(self):
         super().__init__("tcd-break", gdb.COMMAND_BREAKPOINTS)
@@ -274,9 +462,9 @@ LINE is a line of the generated CUDA C source (see tcd-list or the dumped .cl fi
     def invoke(self, arg, from_tty):
         if not arg.strip():
             raise gdb.GdbError("usage: tcd-break KERNEL[:LINE]")
-        k, l = parse_break_spec(arg.strip())
-        bp = KernelBreakpoint(k, l)
-        gdb.write("tcd: breakpoint %d on kernel %s%s\n" % (bp.number, k, (" line %d" % l) if l else " (entry)"))
+        k, l, c = parse_break_spec(arg.strip())
+        bp = KernelBreakpoint(k, l, c)
+        gdb.write("tcd: breakpoint %d on kernel %s%s%s\n" % (bp.number, k, (" line %d" % l) if l else " (entry)", (" if " + c) if c else ""))
 
 
 class TcdBreakpoints(gdb.Command):
@@ -294,6 +482,7 @@ class TcdBreakpoints(gdb.Command):
                 "number": bp.number,
                 "kernel": getattr(bp, "kernel", None),
                 "line": getattr(bp, "kline", None),
+                "condition": getattr(bp, "wanted_condition", None) or bp.condition,
                 "location": bp.location,
                 "hits": bp.hit_count,
                 "enabled": bp.enabled,
@@ -334,7 +523,10 @@ def snapshot(at, exprs):
             threads.append(entry)
             continue
         w = where()
-        entry.update({"line": w["line"], "code": w["code"], "locals": frame_locals(),
+        hints, _, line_hints = analyze_source(w["source"])
+        locs = frame_locals()
+        entry.update({"line": w["line"], "code": w["code"], "meaning": line_hints.get(w["line"]), "locals": locs,
+                      "hints": {k: v for k, v in hints.items() if k in locs},
                       "shared": shared_arrays(w["function"], w["source"]), "print": evaluate(exprs)})
         threads.append(entry)
     if original:
@@ -355,7 +547,8 @@ print one JSON document: every breakpoint hit with the requested thread state.""
             KernelBreakpoint(*parse_break_spec(b))
         max_hits = int(spec.get("hits", 1))
         report = {"hits": [], "kernels": None, "exit": None}
-        _run("run")
+        attached = bool(spec.get("attach"))
+        _run("continue" if attached else "run")
         while True:
             if gdb.selected_inferior().pid == 0:
                 break
@@ -366,6 +559,8 @@ print one JSON document: every breakpoint hit with the requested thread state.""
                 break
             w = where()
             hit = {"where": w, "threads": snapshot(spec.get("at"), spec.get("print", []))}
+            _, arrays, _ = analyze_source(w["source"])
+            hit["arrays"] = array_args(arrays)
             if report["kernels"] is None:
                 report["kernels"] = _run("info cuda kernels")
             report["hits"].append(hit)
@@ -373,11 +568,13 @@ print one JSON document: every breakpoint hit with the requested thread state.""
                 break
             _run("continue")
         if gdb.selected_inferior().pid != 0:
+            for b in [b for b in gdb.breakpoints() if isinstance(b, KernelBreakpoint)]:
+                b.delete()
             try:
-                _run("kill")
+                _run("detach" if attached else "kill")
             except gdb.error:
                 pass
-            report["exit"] = "killed after %d hit(s)" % len(report["hits"])
+            report["exit"] = ("detached" if attached else "killed") + " after %d hit(s)" % len(report["hits"])
         else:
             report["exit"] = "program exited"
         emit({"batch": report})

@@ -26,20 +26,23 @@ $ bin/tcd memcheck --tool racecheck -- -cp examples/classes SharedReduce
 Line 20 is `scratch[lid] = input.get(gid)` and line 33 reads `scratch[lid + stride]`. There
 is no `__syncthreads()` between the write and the read.
 
-**Step 2: see it happen.** Stop at the read twice and compare two warps of block 0:
+**Step 2: see it happen.** Stop at the read twice and compare a thread in warp 0 with one in warp 2 of the same block:
 
 ```
-$ bin/tcd batch -b reduceBuggy:33 --hits 2 --at 0:0 --at 0:100 -- -cp examples/classes SharedReduce
+$ bin/tcd batch -b reduceBuggy:33 --hits 2 --at 0:0 --at 0:64 -- -cp examples/classes SharedReduce
 == hit 2: reduceBuggy at line 33   f_15  =  adf_2[i_14];
--- block (0,0,0) thread (0,0,0)  (line 33)
-   __shared__ adf_2     = {2 <repeats 16 times>, ...}
-   i_10                 = 64          <- warp 0 is at stride 64
--- block (0,0,0) thread (100,0,0)  (line 28)
-   __shared__ adf_2     = {2 <repeats 16 times>, ...}
-   i_10                 = 8           <- warp 3 has already reached stride 8
+
+   locals that differ between the inspected threads:
+                b0 t0           b0 t64
+   i_3          0                64                # ctx.globalIdx
+   i_9          0                64                # ctx.localIdx
+   i_10         64               8                 <- the loop stride
+   f_13         2                1                 # adf_2[ctx.localIdx] (__shared__)
+   ...
+   (line: 33, 27)
 ```
 
-The warps of one block are at different loop iterations, so the later strides read slots
+At the same stop, warp 0 is at stride 64 while warp 2 has already reached stride 8. The warps of one block are at different loop iterations, so the later strides read slots
 that the other warps have not written yet. That is what a missing barrier looks like. The
 **Warps** tab in `tcd ui` shows the same thing as warps at different PCs.
 
@@ -68,12 +71,16 @@ $ bin/tcd memcheck -- -cp examples/classes Saxpy
 tcd memcheck summary (grouped by generated source line):
       32 x  Invalid __global__ read of size 4 bytes @ saxpyBuggy:16
              code:  f_7  =  *(( float *) ul_6);
-             first: block (3906,0,0) thread (160,0,0)   -> tcd batch -b saxpyBuggy:16 --at 3906,0,0:160,0,0
+             first: block (3906,0,0) thread (160,0,0)   -> tcd batch -b saxpyBuggy:16@3906:160 -- ...
 ```
 
 Thread 160 of block 3906 has `globalIdx` = 3906·256 + 160 = 1,000,096, which is past `n`. (The order of
 reports can differ between runs, so the first thread listed may be a different tail thread.) The
-fix is `if (i < y.getSize())` (`saxpyFixed`), and memcheck then reports 0 errors.
+fix is `if (i < y.getSize())` (`saxpyFixed`), and memcheck then reports 0 errors (exit code 0).
+
+The suggested `@3906:160` breakpoint stops exactly on that thread, where `f_7` is shown as `arg2[ctx.globalIdx]`. It takes
+about 2 minutes to get there, because cuda-gdb checks the condition for every warp in the 3,906 blocks before it.
+A smaller `n` reproduces the same bug much faster.
 
 ## Limitations and tips
 

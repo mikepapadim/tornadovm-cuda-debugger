@@ -128,3 +128,6 @@ table.kv td .x { cursor: pointer; color: var(--muted); float: right; }
          grid-template-areas: "left" "center" "right" "bottom"; height: auto; }
   .left, .right { border: none; }
 }
+
+.vhint { display: block; color: var(--accent-ink); font-size: 11px; }
+.meaning { color: var(--accent-ink); margin-right: 12px; }
