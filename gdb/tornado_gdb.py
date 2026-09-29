@@ -31,6 +31,7 @@ import shutil
 SESSION = os.environ.get("TCD_SESSION", os.path.join(os.getcwd(), ".tcd-session"))
 DUMP_ROOT = os.environ.get("TCD_DUMP_ROOT", "")
 JSON_MARK = "TCD-JSON:"
+MAX_ELEMENTS = int(os.environ.get("TCD_MAX_ELEMENTS", "16"))
 
 _FOCUS_RE = re.compile(r"kernel (\d+), (?:grid (-?\d+), )?block \((\d+),(\d+),(\d+)\), thread \((\d+),(\d+),(\d+)\)")
 _current_source_dir = None
@@ -139,9 +140,10 @@ def frame_locals():
     return result
 
 
-def fmt(value, max_elements=16):
+def fmt(value, max_elements=None):
     """Pointers as plain hex (TornadoVM passes arrays as unsigned char*, which gdb
 would otherwise print as strings); arrays such as __shared__ buffers truncated."""
+    max_elements = max_elements or MAX_ELEMENTS
     t = value.type.strip_typedefs()
     if t.code == gdb.TYPE_CODE_PTR:
         return hex(int(value))
@@ -154,10 +156,11 @@ would otherwise print as strings); arrays such as __shared__ buffers truncated."
 _SHARED_RE = re.compile(r"__shared__\s+([\w ]+?)\s+(\w+)\[(\d+)\]")
 
 
-def shared_arrays(kernel, source_path, max_elements=16):
+def shared_arrays(kernel, source_path, max_elements=None):
     """__shared__ arrays declared in the generated kernel, read in the focused block.
 They have no debug type under NVRTC -G, so each is read through its symbol with an
 explicit @shared cast: ((@shared T*)&'kernel::name')[0]@n."""
+    max_elements = max_elements or MAX_ELEMENTS
     out = {}
     if not kernel or not source_path:
         return out
@@ -170,7 +173,7 @@ explicit @shared cast: ((@shared T*)&'kernel::name')[0]@n."""
         n = min(int(size), max_elements)
         expr = "((@shared %s*)&'%s::%s')[0]@%d" % (ctype.strip(), kernel, name, n)
         try:
-            text = str(gdb.parse_and_eval(expr))
+            text = gdb.parse_and_eval(expr).format_string(max_elements=0)
             out[name] = text if n == int(size) else text[:-1] + ", ...}"
         except gdb.error as e:
             out[name] = "<%s>" % e

@@ -17,9 +17,9 @@ reduceBuggy: 1024/1024 blocks wrong -> FAIL
 
 ```
 $ bin/tcd memcheck --tool racecheck -- -cp examples/classes SharedReduce
-========= Error: Race reported between Write access at reduceBuggy+0x160 in tornado_kernel.cu:20
+========= Error: Race reported between Write access at reduceBuggy+0x160 in ~/.tornado-cuda-debug/sessions/<ts>/src/reduceBuggy.cu:20
 =========         >> reduceBuggy:20  adf_2[i_9]  =  f_8;
-=========     and Read access at reduceBuggy+0xf0 in tornado_kernel.cu:33 [524288 hazards]
+=========     and Read access at reduceBuggy+0xf0 in ~/.tornado-cuda-debug/sessions/<ts>/src/reduceBuggy.cu:33 [524288 hazards]
 =========         >> reduceBuggy:33  f_15  =  adf_2[i_14];
 ```
 
@@ -60,7 +60,7 @@ read and write past the end of `x` and `y`, and nothing complains. Under memchec
 ```
 $ bin/tcd memcheck -- -cp examples/classes Saxpy
 ========= Invalid __global__ read of size 4 bytes
-=========     at saxpyBuggy+0xb0 in tornado_kernel.cu:16
+=========     at saxpyBuggy+0xb0 in ~/.tornado-cuda-debug/sessions/<ts>/src/saxpyBuggy.cu:16
 =========         >> saxpyBuggy:16  f_7  =  *(( float *) ul_6);
 =========     by thread (160,0,0) in block (3906,0,0)
 =========     Address 0x10009dd0aa0 is out of bounds

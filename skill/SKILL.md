@@ -22,8 +22,10 @@ Repo: https://github.com/mikepapadim/tornadovm-cuda-debugger. Below, `tcd` means
    - crash, `CUDA_ERROR_LAUNCH_FAILED`, illegal address, grid larger than the data → `tcd memcheck -- …`
    - garbage from uninitialised local memory → `--tool initcheck`; a barrier inside divergent code → `--tool synccheck`
 
-   Each report comes with `>> kernel:LINE  <generated code>`. The summary at the end groups
-   reports by line and prints a ready-made `tcd batch` command for the first failing thread.
+   Each report comes with `>> kernel:LINE  <generated code>`, and its path points at
+   `~/.tornado-cuda-debug/sessions/<ts>/src/<kernel>.cu`. For memcheck-style reports that name a
+   thread, the summary prints a ready-made `tcd batch` command. Race reports name no
+   thread, so choose them yourself (see step 4).
 4. **Inspect the failing thread.**
    `tcd batch -b KERNEL:LINE --at B:T [--at B:T] [--hits N] [-p expr,...] --json -- …`
    - `KERNEL` is the Java method name of the task (`MyClass::reduce` → `reduce`).
@@ -32,9 +34,15 @@ Repo: https://github.com/mikepapadim/tornadovm-cuda-debugger. Below, `tcd` means
    - `--at 2:5` is block 2, thread 5 (1-D). `--at 2,0,0:5,1,0` is the 3-D form.
    - The JSON has `batch.hits[].where` (function, line, code, source path) and
      `batch.hits[].threads[]` with `locals`, `shared` (`__shared__` arrays) and `print`.
-   - Compare a correct thread with a failing one, or the same thread across `--hits 2+`.
-     If threads of one block are at different loop iterations (for example the stride
-     variable differs), there is a missing barrier.
+   - **Choosing threads:** for races, take threads of the *same block* in *different warps*
+     (for example `--at 0:0 --at 0:64`) with `--hits 2` or more. If their loop variables differ at
+     the same hit, one warp ran ahead, and there is a missing barrier. For out-of-bounds bugs, take the
+     thread the sanitizer names, plus a known-good thread.
+   - Only the thread that hit the breakpoint is guaranteed to be at `LINE`. The others are
+     captured wherever they are, and their `line` shows where. A thread reported as "not resident/active" has
+     usually finished already, which is itself evidence (for example a warp that ran ahead).
+   - `__shared__` arrays show 16 elements by default. Use `--elements 256`, or
+     `-p "((@shared float*)&'KERNEL::adf_2')[128]@8"`, to see more.
 5. **Map back to Java.** Generated names are SSA-style (`i_3`, `f_8`, `ul_7`). Read the
    generated source (the path in `where.source`, or `~/.tornado-cuda-debug/sessions/<ts>/dumps/`):
    - `(blockIdx.x*blockDim.x+threadIdx.x)` → `ctx.globalIdx`; `threadIdx.x` → `ctx.localIdx`; `blockIdx.x` → `ctx.groupIdx`
@@ -42,7 +50,8 @@ Repo: https://github.com/mikepapadim/tornadovm-cuda-debugger. Below, `tcd` means
    - `l = (long) i + 4; l << 2` then `ptr + l` → `array.get(i)` for a 4-byte element (the TornadoVM array header is 16 bytes)
    - `argN` is the N-th non-`KernelContext` task parameter.
 6. **Fix the Java, then re-run the same sanitizer command** to confirm 0 errors, and run
-   the program normally to check the result.
+   the program normally to check the result (`$TORNADOVM_HOME/bin/tornado -cp classes Main`).
+   To compile against the SDK: `javac --release 21 --enable-preview -proc:none -cp "$TORNADOVM_HOME/share/java/tornado/*" -d classes src/*.java`.
 
 ## Interactive use (when the user drives)
 
@@ -57,8 +66,9 @@ Repo: https://github.com/mikepapadim/tornadovm-cuda-debugger. Below, `tcd` means
 
 - `-G` debug builds are slow and change scheduling. Keep problem sizes small for
   breakpoint sessions, and trust racecheck (tcd builds with `-lineinfo` only) for races.
-- `<unavailable>` means the variable is not live yet at that line in that thread. Step, or
-  stop at a later line.
+- `<unavailable>` means the variable is not live at that line in that thread. Variables that
+  have not been assigned yet can also show *stale garbage* (a huge `l_23`, a `0` pointer)
+  with no marker. Trust only variables assigned on or before the current `line`.
 - A bare `break add` in raw cuda-gdb also hits JVM host functions named `add`. Always use
   `tcd-break` / `-b`.
 - Batch mode stops at the first hit, and all resident warps stop with it. A thread that is not resident

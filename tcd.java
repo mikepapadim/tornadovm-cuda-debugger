@@ -68,6 +68,7 @@ public class tcd {
         List<String> print = new ArrayList<>();
         int hits = 1;
         int timeout = 600;
+        int elements = 16;
         boolean json;
         boolean verbose;
         boolean tui;
@@ -101,6 +102,7 @@ public class tcd {
                 case "--print", "-p" -> o.print.addAll(List.of(args[++i].split(",")));
                 case "--hits" -> o.hits = Integer.parseInt(args[++i]);
                 case "--timeout" -> o.timeout = Integer.parseInt(args[++i]);
+                case "--elements" -> o.elements = Integer.parseInt(args[++i]);
                 case "--json" -> o.json = true;
                 case "--verbose", "-v" -> o.verbose = true;
                 case "--tui" -> o.tui = true;
@@ -159,6 +161,7 @@ public class tcd {
                   --hits N            batch: stop after N breakpoint hits (default 1)
                   --json              batch: machine-readable output
                   --timeout SECS      batch: kill the session after SECS seconds (default 600)
+                  --elements N        batch/run/ui: array elements shown for locals and __shared__ (default 16)
                   --tool NAME         memcheck: sanitizer tool(s) (memcheck, racecheck, initcheck, synccheck)
                   --verbose, -v       memcheck: print every sanitizer report, not only the first 3
                   --flags "..."       extra NVRTC flags (added to -G -lineinfo)
@@ -307,6 +310,7 @@ public class tcd {
         final String dumpRel;    // relative to TORNADOVM_HOME (TornadoVM always prefixes it)
         final Path dumpAbs;
         final boolean keep;
+        int elements = 16;
 
         Session(Path th, boolean keep) throws IOException {
             String ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS"));
@@ -323,6 +327,7 @@ public class tcd {
             e.put("TORNADOVM_HOME", tornadoHome.toString());
             e.put("TCD_SESSION", dir.toString());
             e.put("TCD_DUMP_ROOT", dumpAbs.toString());
+            e.put("TCD_MAX_ELEMENTS", String.valueOf(elements));
             return e;
         }
 
@@ -351,6 +356,15 @@ public class tcd {
                     Path t = target.resolve(dumpAbs.relativize(p).toString());
                     Files.createDirectories(t.getParent());
                     Files.copy(p, t, StandardCopyOption.REPLACE_EXISTING);
+                }
+                // Same sources under the name a developer looks for: src/<kernel>.cu
+                Path src = dir.resolve("src");
+                for (String k : dumpedKernels(target)) {
+                    Path f = findDump(target, k);
+                    if (f != null) {
+                        Files.createDirectories(src);
+                        Files.copy(f, src.resolve(k + ".cu"), StandardCopyOption.REPLACE_EXISTING);
+                    }
                 }
                 if (!keep) {
                     deleteTree(dumpAbs);
@@ -462,6 +476,7 @@ public class tcd {
     static int run(Options o) throws Exception {
         requireApp(o);
         Session s = new Session(tornadoHome(o), o.keep);
+        s.elements = o.elements;
         List<String> cmd = gdbBase(o, false);
         if (o.tui) {
             cmd.add("-tui");
@@ -493,6 +508,7 @@ public class tcd {
             return 2;
         }
         Session s = new Session(tornadoHome(o), o.keep);
+        s.elements = o.elements;
         List<String> cmd = gdbBase(o, false);
         cmd.addAll(List.of("-batch", "-ex", "tcd-batch", "--args"));
         cmd.addAll(s.javaCommand(o, "-G -lineinfo"));
@@ -604,7 +620,7 @@ public class tcd {
                 }
             }
         }
-        out.println("\n(" + Json.path(b, "exit") + "; generated sources in " + s.dir.resolve("dumps") + ")");
+        out.println("\n(" + Json.path(b, "exit") + "; generated sources in " + s.dir.resolve("src") + ")");
     }
 
     /** Orders generated names by their numeric suffix: i_3 before l_4 before f_12. */
@@ -645,6 +661,7 @@ public class tcd {
     static int memcheck(Options o) throws Exception {
         requireApp(o);
         Session s = new Session(tornadoHome(o), o.keep);
+        s.elements = o.elements;
         Path san = cudaTool("compute-sanitizer", null).orElseThrow(() -> new IllegalStateException("compute-sanitizer not found"));
         List<String> tools = o.tools.isEmpty() ? List.of("memcheck") : o.tools;
         int worst = 0;
@@ -663,6 +680,10 @@ public class tcd {
                     String location = m.find() ? m.group(1) + ":" + m.group(2) : null;
                     String code = location == null ? null : generatedLine(s, m.group(1), Integer.parseInt(m.group(2)));
                     summary.accept(line, location, code);
+                    if (location != null) {
+                        // The sanitizer names NVRTC's virtual file relative to the cwd; point at the real copy.
+                        line = line.replaceFirst("in \\S*tornado_kernel\\.cu:", "in " + Matcher.quoteReplacement(s.dir.resolve("src").resolve(m.group(1) + ".cu").toString()) + ":");
+                    }
                     if (o.verbose || !line.startsWith("=========") || summary.reported <= 3 || line.contains("SUMMARY")) {
                         out.println(line);
                         if (code != null) {
@@ -675,7 +696,7 @@ public class tcd {
             summary.print(o.verbose);
         }
         s.close();
-        err.println("tcd: generated kernel sources: " + s.dir.resolve("dumps"));
+        err.println("tcd: generated kernel sources: " + s.dir.resolve("src") + "/<kernel>.cu");
         return worst;
     }
 
@@ -785,6 +806,7 @@ public class tcd {
     static int ui(Options o) throws Exception {
         requireApp(o);
         Session s = new Session(tornadoHome(o), o.keep);
+        s.elements = o.elements;
         List<String> cmd = gdbBase(o, true);
         cmd.add("--args");
         cmd.addAll(s.javaCommand(o, "-G -lineinfo"));
