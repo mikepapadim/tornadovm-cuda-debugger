@@ -76,7 +76,8 @@ new TaskGraph("s0").task("t0", MyApp::vectorAdd, ctx, a, b, c) ...
    Or use `bin/tcd ui …` and click line numbers to set breakpoints.
 
 Use a small problem size, because debug builds (`-G`) are slow.
-Installing with jbang: `jbang app install tcd@mikepapadim/tornadovm-cuda-debugger` (while the repo is private, this needs access to it). Application arguments go after the main
+Once this repo is public, it can be installed from its jbang catalog: `jbang app install tcd@mikepapadim/tornadovm-cuda-debugger`.
+jbang cannot read the catalog of a private repo, so until then use `bin/tcd` from a clone. Application arguments go after the main
 class, as usual. `@Parallel` loop kernels work the same way (the generated code is a grid-stride loop).
 
 **Examples:** a missing barrier and a silent out-of-bounds write, each found and fixed step
